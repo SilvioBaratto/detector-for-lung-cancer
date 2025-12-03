@@ -1,51 +1,75 @@
+"""
+Segmentation model training application.
+
+Trains U-Net model for nodule segmentation in CT slices.
+
+Design Principles:
+- Dependency Inversion: Dependencies injected via constructor
+- Single Responsibility: Training logic only, logging/checkpointing delegated
+"""
+
 import argparse
 import datetime
-import hashlib
-import os
-import shutil
-import socket
 import sys
-
-import sys
-sys.path.append("..")
+from typing import Optional
 
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
 
 import torch
 import torch.nn as nn
-import torch.optim
-
-from torch.optim import SGD, Adam
+from torch.optim import Adam
 from torch.utils.data import DataLoader
 
+from config import Config, get_config
+from dataset import (
+    SegmentationDataset,
+    TrainingSegmentationDataset,
+    get_ct_cache,
+)
+from model.model_segmentation import (
+    get_segmentation_model,
+    list_segmentation_models,
+    SegmentationAugmentation,
+)
+from training.losses import DiceLoss, LossStrategy
+from training.checkpointing import ModelCheckpointer, create_checkpointer
+from training.logging import TrainingLogger, create_training_logger
 from util.util import enumerateWithEstimate
-from dataset.dsets_segmentation import Luna2dSegmentationDataset, TrainingLuna2dSegmentationDataset, getCt
+from util.device import get_best_device, is_mps_device
 from util.logconf import logging
-from model.model_segmentation import UNetWrapper, SegmentationAugmentation
 
 log = logging.getLogger(__name__)
-# log.setLevel(logging.WARN)
-# log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 
-# Used for computeClassificationLoss and logMetrics to index into metrics_t/metrics_a
-# METRICS_LABEL_NDX = 0
+# Metrics indices
 METRICS_LOSS_NDX = 1
-# METRICS_FN_LOSS_NDX = 2
-# METRICS_ALL_LOSS_NDX = 3
-
-# METRICS_PTP_NDX = 4
-# METRICS_PFN_NDX = 5
-# METRICS_MFP_NDX = 6
 METRICS_TP_NDX = 7
 METRICS_FN_NDX = 8
 METRICS_FP_NDX = 9
-
 METRICS_SIZE = 10
 
+
 class SegmentationTrainingApp:
-    def __init__(self, sys_argv=None):
+    """
+    Training application for segmentation models.
+
+    Supports dependency injection for testing and flexibility:
+    - model: Segmentation model (default: UltraLightUNet via registry)
+    - loss_fn: Loss function (default: DiceLoss)
+    - logger: Training logger (default: TensorBoard)
+    - checkpointer: Model checkpointer (default: ModelCheckpointer)
+    """
+
+    def __init__(
+        self,
+        sys_argv: Optional[list[str]] = None,
+        # Dependency injection
+        config: Optional[Config] = None,
+        model: Optional[nn.Module] = None,
+        loss_fn: Optional[LossStrategy] = None,
+        logger: Optional[TrainingLogger] = None,
+        checkpointer: Optional[ModelCheckpointer] = None,
+    ):
         if sys_argv is None:
             sys_argv = sys.argv[1:]
 
@@ -65,43 +89,45 @@ class SegmentationTrainingApp:
             default=1,
             type=int,
         )
-
         parser.add_argument('--augmented',
             help="Augment the training data.",
             action='store_true',
             default=False,
         )
         parser.add_argument('--augment-flip',
-            help="Augment the training data by randomly flipping the data left-right, up-down, and front-back.",
+            help="Augment the training data by randomly flipping the data.",
             action='store_true',
             default=False,
         )
         parser.add_argument('--augment-offset',
-            help="Augment the training data by randomly offsetting the data slightly along the X and Y axes.",
+            help="Augment the training data by randomly offsetting.",
             action='store_true',
             default=False,
         )
         parser.add_argument('--augment-scale',
-            help="Augment the training data by randomly increasing or decreasing the size of the candidate.",
+            help="Augment the training data by randomly scaling.",
             action='store_true',
             default=False,
         )
         parser.add_argument('--augment-rotate',
-            help="Augment the training data by randomly rotating the data around the head-foot axis.",
+            help="Augment the training data by randomly rotating.",
             action='store_true',
             default=False,
         )
         parser.add_argument('--augment-noise',
-            help="Augment the training data by randomly adding noise to the data.",
+            help="Augment the training data by adding noise.",
             action='store_true',
             default=False,
         )
-
         parser.add_argument('--tb-prefix',
             default='segmentation',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
+            help="Data prefix to use for Tensorboard run.",
         )
-
+        parser.add_argument('--model',
+            default='ultralightunet',
+            choices=list_segmentation_models(),
+            help="Model architecture to use (default: ultralightunet for lightweight)",
+        )
         parser.add_argument('comment',
             help="Comment suffix for Tensorboard run.",
             nargs='?',
@@ -110,10 +136,13 @@ class SegmentationTrainingApp:
 
         self.cli_args = parser.parse_args(sys_argv)
         self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H.%M.%S')
-        self.totalTrainingSamples_count = 0
-        self.trn_writer = None
-        self.val_writer = None
 
+        # Use injected config or create default
+        self.config = config or get_config()
+
+        self.totalTrainingSamples_count = 0
+
+        # Build augmentation settings
         self.augmentation_dict = {}
         if self.cli_args.augmented or self.cli_args.augment_flip:
             self.augmentation_dict['flip'] = True
@@ -126,289 +155,283 @@ class SegmentationTrainingApp:
         if self.cli_args.augmented or self.cli_args.augment_noise:
             self.augmentation_dict['noise'] = 25.0
 
-        self.use_cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda" if self.use_cuda else "cpu")
+        # Device setup (MPS > CUDA > CPU)
+        self.device = get_best_device()
+        self.use_cuda = self.device.type in ('cuda', 'mps')
 
-        self.segmentation_model, self.augmentation_model = self.initModel()
+        # Dependency injection with defaults
+        if model is not None:
+            self.segmentation_model = model
+            self.augmentation_model = SegmentationAugmentation(**self.augmentation_dict)
+        else:
+            self.segmentation_model, self.augmentation_model = self.initModel()
+
         self.optimizer = self.initOptimizer()
+        self.dice_loss = loss_fn or DiceLoss()
 
+        # Initialize logger (injected or created)
+        self.logger = logger or create_training_logger(
+            base_dir="../../runs",
+            tb_prefix=self.cli_args.tb_prefix,
+            time_str=self.time_str,
+            comment=self.cli_args.comment,
+            mode="seg",
+        )
+
+        # Initialize checkpointer (injected or created)
+        self.checkpointer = checkpointer or create_checkpointer(
+            base_dir="../../models",
+            tb_prefix=self.cli_args.tb_prefix,
+            model_type="seg",
+            time_str=self.time_str,
+            comment=self.cli_args.comment,
+        )
 
     def initModel(self):
-        segmentation_model = UNetWrapper(
+        """Initialize segmentation and augmentation models."""
+        model_name = self.cli_args.model
+        log.info(f"Initializing model: {model_name}")
+
+        segmentation_model = get_segmentation_model(
+            model_name,
             in_channels=7,
             n_classes=1,
-            depth=3,
-            wf=4,
-            padding=True,
-            batch_norm=True,
-            up_mode='upconv',
         )
 
         augmentation_model = SegmentationAugmentation(**self.augmentation_dict)
 
         if self.use_cuda:
-            log.info("Using CUDA; {} devices.".format(torch.cuda.device_count()))
-            if torch.cuda.device_count() > 1:
-                segmentation_model = nn.DataParallel(segmentation_model)
-                augmentation_model = nn.DataParallel(augmentation_model)
+            if self.device.type == 'cuda':
+                log.info(f"Using CUDA; {torch.cuda.device_count()} devices.")
+                if torch.cuda.device_count() > 1:
+                    segmentation_model = nn.DataParallel(segmentation_model)
+                    augmentation_model = nn.DataParallel(augmentation_model)
+            elif is_mps_device(self.device):
+                log.info("Using MPS (Apple Silicon)")
             segmentation_model = segmentation_model.to(self.device)
             augmentation_model = augmentation_model.to(self.device)
 
         return segmentation_model, augmentation_model
 
     def initOptimizer(self):
+        """Initialize the optimizer."""
         return Adam(self.segmentation_model.parameters())
-        # return SGD(self.segmentation_model.parameters(), lr=0.001, momentum=0.99)
-
 
     def initTrainDl(self):
-        train_ds = TrainingLuna2dSegmentationDataset(
+        """Initialize training data loader."""
+        train_ds = TrainingSegmentationDataset(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=False,
-            contextSlices_count=3,
+            is_validation=False,
+            context_slices=3,
         )
 
         batch_size = self.cli_args.batch_size
-        if self.use_cuda:
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
             batch_size *= torch.cuda.device_count()
 
-        train_dl = DataLoader(
+        return DataLoader(
             train_ds,
             batch_size=batch_size,
             num_workers=self.cli_args.num_workers,
             pin_memory=self.use_cuda,
         )
 
-        return train_dl
-
     def initValDl(self):
-        val_ds = Luna2dSegmentationDataset(
+        """Initialize validation data loader."""
+        val_ds = SegmentationDataset(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=True,
-            contextSlices_count=3,
+            is_validation=True,
+            context_slices=3,
         )
 
         batch_size = self.cli_args.batch_size
-        if self.use_cuda:
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
             batch_size *= torch.cuda.device_count()
 
-        val_dl = DataLoader(
+        return DataLoader(
             val_ds,
             batch_size=batch_size,
             num_workers=self.cli_args.num_workers,
             pin_memory=self.use_cuda,
         )
 
-        return val_dl
-
     def initTensorboardWriters(self):
-        if self.trn_writer is None:
-            log_dir = os.path.join('../../runs', self.cli_args.tb_prefix, self.time_str)
-
-            self.trn_writer = SummaryWriter(
-                log_dir=log_dir + '_trn_seg_' + self.cli_args.comment)
-            self.val_writer = SummaryWriter(
-                log_dir=log_dir + '_val_seg_' + self.cli_args.comment)
+        """Initialize TensorBoard writers (now delegated to logger)."""
+        # Logger is initialized in __init__, this is kept for compatibility
+        pass
 
     def main(self):
-        log.info("Starting {}, {}".format(type(self).__name__, self.cli_args))
+        """Main training loop."""
+        log.info(f"Starting {type(self).__name__}, {self.cli_args}")
 
         train_dl = self.initTrainDl()
         val_dl = self.initValDl()
 
         best_score = 0.0
-        self.validation_cadence = 5
-        for epoch_ndx in range(1, self.cli_args.epochs + 1):                # Our outermost loop, over the epochs
-            log.info("Epoch {} of {}, {}/{} batches of size {}*{}".format(
-                epoch_ndx,
-                self.cli_args.epochs,
-                len(train_dl),
-                len(val_dl),
-                self.cli_args.batch_size,
-                (torch.cuda.device_count() if self.use_cuda else 1),
-            ))
+        validation_cadence = 5
 
-            trnMetrics_t = self.doTraining(epoch_ndx, train_dl) 
-            self.logMetrics(epoch_ndx, 'trn', trnMetrics_t) # Logs the (scalar) metrics from training after
-                                                            # each epoch
+        for epoch_ndx in range(1, self.cli_args.epochs + 1):
+            log.info(
+                f"Epoch {epoch_ndx} of {self.cli_args.epochs}, "
+                f"{len(train_dl)}/{len(val_dl)} batches of size "
+                f"{self.cli_args.batch_size}*{torch.cuda.device_count() if self.use_cuda else 1}"
+            )
 
-            if epoch_ndx == 1 or epoch_ndx % self.validation_cadence == 0:  # Only every validation cadence-th interval
-                # if validation is wanted
+            trnMetrics_t = self.doTraining(epoch_ndx, train_dl)
+            self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
+
+            if epoch_ndx == 1 or epoch_ndx % validation_cadence == 0:
                 valMetrics_t = self.doValidation(epoch_ndx, val_dl)
                 score = self.logMetrics(epoch_ndx, 'val', valMetrics_t)
-                best_score = max(score, best_score) # Computes the score. As we saw earlier, we take the recall
+                best_score = max(score, best_score)
 
-                self.saveModel('seg', epoch_ndx, score == best_score)   # Now we only need to write saveModel. The third parameter
-                                                                        # is whether we want to save it as best model, too.
-
-                self.logImages(epoch_ndx, 'trn', train_dl)  # We validate the model and log images
+                self.saveModel('seg', epoch_ndx, score == best_score)
+                self.logImages(epoch_ndx, 'trn', train_dl)
                 self.logImages(epoch_ndx, 'val', val_dl)
 
-        self.trn_writer.close()
-        self.val_writer.close()
+        # Close the logger
+        self.logger.close()
 
     def doTraining(self, epoch_ndx, train_dl):
+        """Execute one training epoch."""
         trnMetrics_g = torch.zeros(METRICS_SIZE, len(train_dl.dataset), device=self.device)
         self.segmentation_model.train()
-        train_dl.dataset.shuffleSamples()
+        train_dl.dataset.shuffle()
 
         batch_iter = enumerateWithEstimate(
             train_dl,
-            "E{} Training".format(epoch_ndx),
+            f"E{epoch_ndx} Training",
             start_ndx=train_dl.num_workers,
         )
+
         for batch_ndx, batch_tup in batch_iter:
             self.optimizer.zero_grad()
-
             loss_var = self.computeBatchLoss(batch_ndx, batch_tup, train_dl.batch_size, trnMetrics_g)
             loss_var.backward()
-
             self.optimizer.step()
 
         self.totalTrainingSamples_count += trnMetrics_g.size(1)
-
         return trnMetrics_g.to('cpu')
 
     def doValidation(self, epoch_ndx, val_dl):
+        """Execute validation."""
         with torch.no_grad():
             valMetrics_g = torch.zeros(METRICS_SIZE, len(val_dl.dataset), device=self.device)
             self.segmentation_model.eval()
 
             batch_iter = enumerateWithEstimate(
                 val_dl,
-                "E{} Validation ".format(epoch_ndx),
+                f"E{epoch_ndx} Validation",
                 start_ndx=val_dl.num_workers,
             )
+
             for batch_ndx, batch_tup in batch_iter:
                 self.computeBatchLoss(batch_ndx, batch_tup, val_dl.batch_size, valMetrics_g)
 
         return valMetrics_g.to('cpu')
 
     def computeBatchLoss(self, batch_ndx, batch_tup, batch_size, metrics_g,
-                         classificationThreshold=0.5):
-        input_t, label_t, series_list, _slice_ndx_list = batch_tup
+                         classification_threshold=0.5):
+        """Compute loss for a batch."""
+        input_t, label_t, _series_list, _slice_ndx_list = batch_tup
 
-        input_g = input_t.to(self.device, non_blocking=True)    # transfer to GPU
+        input_g = input_t.to(self.device, non_blocking=True)
         label_g = label_t.to(self.device, non_blocking=True)
 
-        if self.segmentation_model.training and self.augmentation_dict: # Augments as needed if we are training. In validation,
-                                                                        # we would skip this.
+        # Augment during training if enabled
+        if self.segmentation_model.training and self.augmentation_dict:
             input_g, label_g = self.augmentation_model(input_g, label_g)
 
-        prediction_g = self.segmentation_model(input_g) # Runs the segmentation model ...
+        prediction_g = self.segmentation_model(input_g)
 
-        diceLoss_g = self.diceLoss(prediction_g, label_g)           # And applied our fine Dice loss
-        fnLoss_g = self.diceLoss(prediction_g * label_g, label_g)
+        # Dice loss with false negative weighting
+        diceLoss_g = self.dice_loss(prediction_g, label_g, reduction="none")
+        fnLoss_g = self.dice_loss(prediction_g * label_g, label_g, reduction="none")
 
         start_ndx = batch_ndx * batch_size
         end_ndx = start_ndx + input_t.size(0)
 
         with torch.no_grad():
-            predictionBool_g = (prediction_g[:, 0:1]
-                                > classificationThreshold).to(torch.float32)    # We threshold the prediction to get "hard" Dice
-                                                                                # but convert to float for the latter multiplication
+            predictionBool_g = (prediction_g[:, 0:1] > classification_threshold).to(torch.float32)
 
-            tp = (     predictionBool_g *  label_g).sum(dim=[1,2,3])    # Computing true positives, false positives and 
-                                                                        # false negatives is similar to what we did when computing
-                                                                        # the Dice loss
-            fn = ((1 - predictionBool_g) *  label_g).sum(dim=[1,2,3])
-            fp = (     predictionBool_g * (~label_g)).sum(dim=[1,2,3])
+            tp = (predictionBool_g * label_g).sum(dim=[1, 2, 3])
+            fn = ((1 - predictionBool_g) * label_g).sum(dim=[1, 2, 3])
+            fp = (predictionBool_g * (~label_g)).sum(dim=[1, 2, 3])
 
-            metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = diceLoss_g # We store our metrics to a large tensor for future reference.
-                                                                        # This is per batch item rather than averaged over the batch
+            metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = diceLoss_g
             metrics_g[METRICS_TP_NDX, start_ndx:end_ndx] = tp
             metrics_g[METRICS_FN_NDX, start_ndx:end_ndx] = fn
             metrics_g[METRICS_FP_NDX, start_ndx:end_ndx] = fp
 
         return diceLoss_g.mean() + fnLoss_g.mean() * 8
 
-    def diceLoss(self, prediction_g, label_g, epsilon=1):
-        diceLabel_g = label_g.sum(dim=[1,2,3])                      # Sums over everything except the batch dimension to get
-                                                                    # get the positively labeled, (softly) positively detected,
-                                                                    # and (softly) correct positives per batch item
-        dicePrediction_g = prediction_g.sum(dim=[1,2,3])
-        diceCorrect_g = (prediction_g * label_g).sum(dim=[1,2,3])
-
-        diceRatio_g = (2 * diceCorrect_g + epsilon) \
-            / (dicePrediction_g + diceLabel_g + epsilon)    # The Dice ratio. To avoid problems when we accidentally have neither
-                                                            # predictions nor labels, we add 1 both numerator and denominator
-
-        return 1 - diceRatio_g  # To make it a loss, we take 1 - Dice ratio, so lower loss is better
-
-
     def logImages(self, epoch_ndx, mode_str, dl):
-        self.segmentation_model.eval()  # set the model to eval
+        """Log sample images to TensorBoard."""
+        self.segmentation_model.eval()
+        ct_cache = get_ct_cache(self.config)
 
-        images = sorted(dl.dataset.series_list)[:12]    # takes (the same) 12 CTs by bypassing the data loader and using
-                                                        # the dataset directly. The series list might be shuffled, so we sort
+        # Take first 12 series (sorted for consistency)
+        images = sorted(dl.dataset.series_list)[:12]
+
         for series_ndx, series_uid in enumerate(images):
-            ct = getCt(series_uid)
+            ct = ct_cache.get_segmentation(series_uid)
 
             for slice_ndx in range(6):
-                ct_ndx = slice_ndx * (ct.hu_a.shape[0] - 1) // 5    # Selects six equidistant slices throughout the CT
-                sample_tup = dl.dataset.getitem_fullSlice(series_uid, ct_ndx)
-
-                ct_t, label_t, series_uid, ct_ndx = sample_tup
+                # Select six equidistant slices
+                ct_ndx = slice_ndx * (ct.num_slices - 1) // 5
+                ct_t, label_t, _, _ = dl.dataset._get_slice(series_uid, ct_ndx)
 
                 input_g = ct_t.to(self.device).unsqueeze(0)
-                label_g = pos_g = label_t.to(self.device).unsqueeze(0)
+                label_g = label_t.to(self.device).unsqueeze(0)
 
                 prediction_g = self.segmentation_model(input_g)[0]
                 prediction_a = prediction_g.to('cpu').detach().numpy()[0] > 0.5
                 label_a = label_g.cpu().numpy()[0][0] > 0.5
 
-                ct_t[:-1,:,:] /= 2000
-                ct_t[:-1,:,:] += 0.5
+                # Normalize CT values for display
+                ct_t[:-1, :, :] /= 2000
+                ct_t[:-1, :, :] += 0.5
 
-                ctSlice_a = ct_t[dl.dataset.contextSlices_count].numpy()
+                ctSlice_a = ct_t[dl.dataset.context_slices].numpy()
 
+                # Build visualization image
                 image_a = np.zeros((512, 512, 3), dtype=np.float32)
-                image_a[:,:,:] = ctSlice_a.reshape((512,512,1))
-                image_a[:,:,0] += prediction_a & (1 - label_a)  # False positive are flagged as red and overlaid on the image
-                image_a[:,:,0] += (1 - prediction_a) & label_a  # False negatives are orange
-                image_a[:,:,1] += ((1 - prediction_a) & label_a) * 0.5
-
-                image_a[:,:,1] += prediction_a & label_a    # True positives are green
+                image_a[:, :, :] = ctSlice_a.reshape((512, 512, 1))
+                image_a[:, :, 0] += prediction_a & (1 - label_a)  # False positive: red
+                image_a[:, :, 0] += (1 - prediction_a) & label_a  # False negative: orange
+                image_a[:, :, 1] += ((1 - prediction_a) & label_a) * 0.5
+                image_a[:, :, 1] += prediction_a & label_a  # True positive: green
                 image_a *= 0.5
                 image_a.clip(0, 1, image_a)
 
-                writer = getattr(self, mode_str + '_writer')
-                writer.add_image(
-                    f'{mode_str}/{series_ndx}_prediction_{slice_ndx}',
-                    image_a,
-                    self.totalTrainingSamples_count,
-                    dataformats='HWC',
-                )
+                tag = f'{mode_str}/{series_ndx}_prediction_{slice_ndx}'
+                step = self.totalTrainingSamples_count
+
+                if mode_str == 'trn':
+                    self.logger.log_training_image(tag, image_a, step, dataformats='HWC')
+                else:
+                    self.logger.log_validation_image(tag, image_a, step, dataformats='HWC')
 
                 if epoch_ndx == 1:
                     image_a = np.zeros((512, 512, 3), dtype=np.float32)
-                    image_a[:,:,:] = ctSlice_a.reshape((512,512,1))
-                    # image_a[:,:,0] += (1 - label_a) & lung_a # Red
-                    image_a[:,:,1] += label_a  # Green
-                    # image_a[:,:,2] += neg_a  # Blue
-
+                    image_a[:, :, :] = ctSlice_a.reshape((512, 512, 1))
+                    image_a[:, :, 1] += label_a  # Green for labels
                     image_a *= 0.5
                     image_a[image_a < 0] = 0
                     image_a[image_a > 1] = 1
-                    writer.add_image(
-                        '{}/{}_label_{}'.format(
-                            mode_str,
-                            series_ndx,
-                            slice_ndx,
-                        ),
-                        image_a,
-                        self.totalTrainingSamples_count,
-                        dataformats='HWC',
-                    )
-                # This flush prevents TB from getting confused about which
-                # data item belongs where.
-                writer.flush()
+                    label_tag = f'{mode_str}/{series_ndx}_label_{slice_ndx}'
+                    if mode_str == 'trn':
+                        self.logger.log_training_image(label_tag, image_a, step, dataformats='HWC')
+                    else:
+                        self.logger.log_validation_image(label_tag, image_a, step, dataformats='HWC')
+
+        self.logger.flush()
 
     def logMetrics(self, epoch_ndx, mode_str, metrics_t):
-        log.info("E{} {}".format(
-            epoch_ndx,
-            type(self).__name__,
-        ))
+        """Log metrics to TensorBoard and console."""
+        log.info(f"E{epoch_ndx} {type(self).__name__}")
 
         metrics_a = metrics_t.detach().numpy()
         sum_a = metrics_a.sum(axis=1)
@@ -417,106 +440,60 @@ class SegmentationTrainingApp:
         allLabel_count = sum_a[METRICS_TP_NDX] + sum_a[METRICS_FN_NDX]
 
         metrics_dict = {}
-        metrics_dict['loss/all'] = metrics_a[METRICS_LOSS_NDX].mean()
+        metrics_dict['seg_loss/all'] = float(metrics_a[METRICS_LOSS_NDX].mean())
 
-        metrics_dict['percent_all/tp'] = \
-            sum_a[METRICS_TP_NDX] / (allLabel_count or 1) * 100
-        metrics_dict['percent_all/fn'] = \
-            sum_a[METRICS_FN_NDX] / (allLabel_count or 1) * 100
-        metrics_dict['percent_all/fp'] = \
-            sum_a[METRICS_FP_NDX] / (allLabel_count or 1) * 100 # Can be larger thant 100% since we're comparing to the total
-                                                                # number of pixels labeled as candidate nodules, which is tiny
-                                                                # fraction of each image
+        metrics_dict['seg_percent_all/tp'] = sum_a[METRICS_TP_NDX] / (allLabel_count or 1) * 100
+        metrics_dict['seg_percent_all/fn'] = sum_a[METRICS_FN_NDX] / (allLabel_count or 1) * 100
+        metrics_dict['seg_percent_all/fp'] = sum_a[METRICS_FP_NDX] / (allLabel_count or 1) * 100
 
+        precision = metrics_dict['seg_pr/precision'] = (
+            sum_a[METRICS_TP_NDX] / ((sum_a[METRICS_TP_NDX] + sum_a[METRICS_FP_NDX]) or 1)
+        )
+        recall = metrics_dict['seg_pr/recall'] = (
+            sum_a[METRICS_TP_NDX] / ((sum_a[METRICS_TP_NDX] + sum_a[METRICS_FN_NDX]) or 1)
+        )
+        metrics_dict['seg_pr/f1_score'] = 2 * (precision * recall) / ((precision + recall) or 1)
 
-        precision = metrics_dict['pr/precision'] = sum_a[METRICS_TP_NDX] \
-            / ((sum_a[METRICS_TP_NDX] + sum_a[METRICS_FP_NDX]) or 1)
-        recall    = metrics_dict['pr/recall']    = sum_a[METRICS_TP_NDX] \
-            / ((sum_a[METRICS_TP_NDX] + sum_a[METRICS_FN_NDX]) or 1)
-
-        metrics_dict['pr/f1_score'] = 2 * (precision * recall) \
-            / ((precision + recall) or 1)
-
-        log.info(("E{} {:8} "
-                 + "{loss/all:.4f} loss, "
-                 + "{pr/precision:.4f} precision, "
-                 + "{pr/recall:.4f} recall, "
-                 + "{pr/f1_score:.4f} f1 score"
-                  ).format(
-            epoch_ndx,
-            mode_str,
-            **metrics_dict,
-        ))
-        log.info(("E{} {:8} "
-                  + "{loss/all:.4f} loss, "
-                  + "{percent_all/tp:-5.1f}% tp, {percent_all/fn:-5.1f}% fn, {percent_all/fp:-9.1f}% fp"
-        ).format(
-            epoch_ndx,
-            mode_str + '_all',
-            **metrics_dict,
-        ))
-
-        self.initTensorboardWriters()
-        writer = getattr(self, mode_str + '_writer')
-
-        prefix_str = 'seg_'
-
-        for key, value in metrics_dict.items():
-            writer.add_scalar(prefix_str + key, value, self.totalTrainingSamples_count)
-
-        writer.flush()
-
-        score = metrics_dict['pr/recall']
-
-        return score
-
-    def saveModel(self, type_str, epoch_ndx, isBest=False):
-        file_path = os.path.join(
-            '..',
-            '..',
-            'models',
-            self.cli_args.tb_prefix,
-            '{}_{}_{}.{}.state'.format(
-                type_str,
-                self.time_str,
-                self.cli_args.comment,
-                self.totalTrainingSamples_count,
-            )
+        log.info(
+            f"E{epoch_ndx} {mode_str:8} "
+            f"{metrics_dict['seg_loss/all']:.4f} loss, "
+            f"{metrics_dict['seg_pr/precision']:.4f} precision, "
+            f"{metrics_dict['seg_pr/recall']:.4f} recall, "
+            f"{metrics_dict['seg_pr/f1_score']:.4f} f1 score"
+        )
+        log.info(
+            f"E{epoch_ndx} {mode_str + '_all':8} "
+            f"{metrics_dict['seg_loss/all']:.4f} loss, "
+            f"{metrics_dict['seg_percent_all/tp']:-5.1f}% tp, "
+            f"{metrics_dict['seg_percent_all/fn']:-5.1f}% fn, "
+            f"{metrics_dict['seg_percent_all/fp']:-9.1f}% fp"
         )
 
-        os.makedirs(os.path.dirname(file_path), mode=0o755, exist_ok=True)
+        # Use injected logger
+        step = self.totalTrainingSamples_count
+        if mode_str == 'trn':
+            self.logger.log_training_metrics(metrics_dict, step)
+        else:
+            self.logger.log_validation_metrics(metrics_dict, step)
 
-        model = self.segmentation_model
-        if isinstance(model, torch.nn.DataParallel):
-            model = model.module    # Get rid of the DataParallel wrapper, it it exist
+        self.logger.flush()
+        return metrics_dict['seg_pr/recall']
 
-        state = {
-            'sys_argv': sys.argv,
-            'time': str(datetime.datetime.now()),
-            'model_state': model.state_dict(),  # Important part
-            'model_name': type(model).__name__,
-            'optimizer_state' : self.optimizer.state_dict(),    # Preserve momentum and so on
-            'optimizer_name': type(self.optimizer).__name__,
+    def saveModel(self, _type_str, epoch_ndx, isBest=False):
+        """Save model checkpoint using injected checkpointer."""
+        metrics = {
             'epoch': epoch_ndx,
-            'totalTrainingSamples_count': self.totalTrainingSamples_count,
+            'total_samples': self.totalTrainingSamples_count,
         }
-        torch.save(state, file_path)
 
-        log.info("Saved model params to {}".format(file_path))
-
-        if isBest:
-            best_path = os.path.join(
-                '..', 
-                '..', 
-                'models',
-                self.cli_args.tb_prefix,
-                f'{type_str}_{self.time_str}_{self.cli_args.comment}.best.state')
-            shutil.copyfile(file_path, best_path)
-
-            log.info("Saved model params to {}".format(best_path))
-
-        with open(file_path, 'rb') as f:
-            log.info("SHA1: " + hashlib.sha1(f.read()).hexdigest())
+        self.checkpointer.save(
+            model=self.segmentation_model,
+            optimizer=self.optimizer,
+            epoch=epoch_ndx,
+            total_samples=self.totalTrainingSamples_count,
+            metrics=metrics,
+            is_best=isBest,
+        )
 
 
 if __name__ == '__main__':

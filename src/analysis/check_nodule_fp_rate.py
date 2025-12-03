@@ -1,37 +1,43 @@
+"""
+False positive rate analysis application.
+
+Checks the false positive rate of the segmentation and classification pipeline.
+"""
+
 import argparse
 import glob
 import hashlib
-import math
 import os
 import sys
 
 import numpy as np
 import scipy.ndimage.measurements as measure
-import scipy.ndimage.morphology as morph
 
 import torch
 import torch.nn as nn
-import torch.optim
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from util.util import enumerateWithEstimate
-# from .dsets import LunaDataset, Luna2dSegmentationDataset, getCt, getCandidateInfoList, CandidateInfoTuple
-from dsets_segmentation import Luna2dSegmentationDataset, getCt, getCandidateInfoList, getCandidateInfoDict, CandidateInfoTuple
-from dsets_classification import LunaDataset
-from model_segmentation import UNetWrapper
-from model_classification import LunaModel
-
+from config import get_config
+from dataset import (
+    CandidateInfo,
+    SegmentationDataset,
+    ClassificationDataset,
+    get_candidate_repository,
+    get_ct_cache,
+)
+from model.model_segmentation import get_segmentation_model
+from model.model_classification import get_model
+from util.util import enumerateWithEstimate, irc2xyz
 from util.logconf import logging
-from util.util import xyz2irc, irc2xyz
 
 log = logging.getLogger(__name__)
-# log.setLevel(logging.WARN)
-# log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 
 
 class FalsePosRateCheckApp:
+    """Application for checking false positive rates."""
+
     def __init__(self, sys_argv=None):
         if sys_argv is None:
             log.debug(sys.argv)
@@ -48,71 +54,55 @@ class FalsePosRateCheckApp:
             default=8,
             type=int,
         )
-
         parser.add_argument('--series-uid',
             help='Limit inference to this Series UID only.',
             default=None,
             type=str,
         )
-
         parser.add_argument('--include-train',
-            help="Include data that was in the training set. (default: validation data only)",
+            help="Include data that was in the training set.",
             action='store_true',
             default=False,
         )
-
         parser.add_argument('--segmentation-path',
             help="Path to the saved segmentation model",
             nargs='?',
             default=None,
         )
-
         parser.add_argument('--classification-path',
             help="Path to the saved classification model",
             nargs='?',
             default=None,
         )
-
         parser.add_argument('--tb-prefix',
             default='p2ch13',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
+            help="Data prefix to use for Tensorboard run.",
         )
 
         self.cli_args = parser.parse_args(sys_argv)
-        # self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+        self.config = get_config()
 
         self.use_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
 
         if not self.cli_args.segmentation_path:
             self.cli_args.segmentation_path = self.initModelPath('seg')
-
         if not self.cli_args.classification_path:
             self.cli_args.classification_path = self.initModelPath('cls')
 
         self.seg_model, self.cls_model = self.initModels()
 
+        # Initialize data access
+        self.candidate_repo = get_candidate_repository(self.config)
+        self.ct_cache = get_ct_cache(self.config)
+
     def initModelPath(self, type_str):
-        # local_path = os.path.join(
-        #     'data-unversioned',
-        #     'part2',
-        #     'models',
-        #     self.cli_args.tb_prefix,
-        #     type_str + '_{}_{}.{}.state'.format('*', '*', 'best'),
-        # )
-        #
-        # file_list = glob.glob(local_path)
-        # if not file_list:
+        """Find model path by pattern matching."""
         pretrained_path = os.path.join(
-            'data',
-            'part2',
-            'models',
-            type_str + '_{}_{}.{}.state'.format('*', '*', '*'),
+            'data', 'part2', 'models',
+            f'{type_str}_*_*.*.state',
         )
         file_list = glob.glob(pretrained_path)
-        # else:
-        #     pretrained_path = None
-
         file_list.sort()
 
         try:
@@ -122,20 +112,17 @@ class FalsePosRateCheckApp:
             raise
 
     def initModels(self):
+        """Initialize segmentation and classification models."""
         with open(self.cli_args.segmentation_path, 'rb') as f:
             log.debug(self.cli_args.segmentation_path)
             log.debug(hashlib.sha1(f.read()).hexdigest())
 
         seg_dict = torch.load(self.cli_args.segmentation_path)
 
-        seg_model = UNetWrapper(
+        seg_model = get_segmentation_model(
+            'ultralightunet',
             in_channels=7,
             n_classes=1,
-            depth=3,
-            wf=4,
-            padding=True,
-            batch_norm=True,
-            up_mode='upconv',
         )
         seg_model.load_state_dict(seg_dict['model_state'])
         seg_model.eval()
@@ -146,8 +133,7 @@ class FalsePosRateCheckApp:
 
         cls_dict = torch.load(self.cli_args.classification_path)
 
-        cls_model = LunaModel()
-        # cls_model = AlternateLunaModel()
+        cls_model = get_model('mifnet')
         cls_model.load_state_dict(cls_dict['model_state'])
         cls_model.eval()
 
@@ -155,7 +141,6 @@ class FalsePosRateCheckApp:
             if torch.cuda.device_count() > 1:
                 seg_model = nn.DataParallel(seg_model)
                 cls_model = nn.DataParallel(cls_model)
-
             seg_model = seg_model.to(self.device)
             cls_model = cls_model.to(self.device)
 
@@ -165,97 +150,80 @@ class FalsePosRateCheckApp:
 
         return seg_model, cls_model
 
-
     def initSegmentationDl(self, series_uid):
-        seg_ds = Luna2dSegmentationDataset(
-                contextSlices_count=3,
-                series_uid=series_uid,
-                fullCt_bool=True,
-            )
-        seg_dl = DataLoader(
+        """Initialize segmentation data loader."""
+        seg_ds = SegmentationDataset(
+            config=self.config,
+            context_slices=3,
+            series_uid=series_uid,
+            full_ct=True,
+        )
+        return DataLoader(
             seg_ds,
             batch_size=self.cli_args.batch_size * (torch.cuda.device_count() if self.use_cuda else 1),
-            num_workers=1, #self.cli_args.num_workers,
+            num_workers=1,
             pin_memory=self.use_cuda,
         )
 
-        return seg_dl
-
-    def initClassificationDl(self, candidateInfo_list):
-        cls_ds = LunaDataset(
-                sortby_str='series_uid',
-                candidateInfo_list=candidateInfo_list,
-            )
-        cls_dl = DataLoader(
+    def initClassificationDl(self, candidate_list):
+        """Initialize classification data loader."""
+        cls_ds = _CandidateDataset(
+            candidates=candidate_list,
+            config=self.config,
+            ct_cache=self.ct_cache,
+        )
+        return DataLoader(
             cls_ds,
             batch_size=self.cli_args.batch_size * (torch.cuda.device_count() if self.use_cuda else 1),
-            num_workers=1, #self.cli_args.num_workers,
+            num_workers=1,
             pin_memory=self.use_cuda,
         )
 
-        return cls_dl
-
-
     def main(self):
-        log.info("Starting {}, {}".format(type(self).__name__, self.cli_args))
+        """Main analysis loop."""
+        log.info(f"Starting {type(self).__name__}, {self.cli_args}")
 
-        val_ds = LunaDataset(
+        # Get validation set series
+        val_ds = ClassificationDataset(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=True,
+            is_validation=True,
         )
-        val_set = set(
-            candidateInfo_tup.series_uid
-            for candidateInfo_tup in val_ds.candidateInfo_list
-        )
-        positive_set = set(
-            candidateInfo_tup.series_uid
-            for candidateInfo_tup in getCandidateInfoList()
-            if candidateInfo_tup.isNodule_bool
-        )
+        val_set = set(c.series_uid for c in val_ds.candidates)
+
+        # Get all candidates
+        all_candidates = self.candidate_repo.get_all()
+        positive_set = set(c.series_uid for c in all_candidates if c.is_nodule)
 
         if self.cli_args.series_uid:
             series_set = set(self.cli_args.series_uid.split(','))
         else:
-            series_set = set(
-                candidateInfo_tup.series_uid
-                for candidateInfo_tup in getCandidateInfoList()
-            )
+            series_set = set(c.series_uid for c in all_candidates)
 
         train_list = sorted(series_set - val_set) if self.cli_args.include_train else []
         val_list = sorted(series_set & val_set)
-
 
         total_tp = total_tn = total_fp = total_fn = 0
         total_missed_pos = 0
         missed_pos_dist_list = []
         missed_pos_cit_list = []
-        candidateInfo_dict = getCandidateInfoDict()
-        # series2results_dict = {}
-        # seg_candidateInfo_list = []
-        series_iter = enumerateWithEstimate(
-            val_list + train_list,
-            "Series",
-        )
+
+        candidate_dict = self.candidate_repo.get_by_series()
+
+        series_iter = enumerateWithEstimate(val_list + train_list, "Series")
+
         for _series_ndx, series_uid in series_iter:
             ct, _output_g, _mask_g, clean_g = self.segmentCt(series_uid)
 
-            seg_candidateInfo_list, _seg_centerIrc_list, _ = self.clusterSegmentationOutput(
-                series_uid,
-                ct,
-                clean_g,
+            seg_candidate_list, _seg_centerIrc_list, _ = self.clusterSegmentationOutput(
+                series_uid, ct, clean_g
             )
-            if not seg_candidateInfo_list:
+            if not seg_candidate_list:
                 continue
 
-            cls_dl = self.initClassificationDl(seg_candidateInfo_list)
+            cls_dl = self.initClassificationDl(seg_candidate_list)
             results_list = []
 
-            # batch_iter = enumerateWithEstimate(
-            #     cls_dl,
-            #     "Cls all",
-            #     start_ndx=cls_dl.num_workers,
-            # )
-            # for batch_ndx, batch_tup in batch_iter:
             for batch_ndx, batch_tup in enumerate(cls_dl):
                 input_t, label_t, index_t, series_list, center_t = batch_tup
 
@@ -263,83 +231,57 @@ class FalsePosRateCheckApp:
                 with torch.no_grad():
                     _logits_g, probability_g = self.cls_model(input_g)
                 probability_t = probability_g.to('cpu')
-                # probability_t = torch.tensor([[0, 1]] * input_t.shape[0], dtype=torch.float32)
 
                 for i, _series_uid in enumerate(series_list):
-                    assert series_uid == _series_uid, repr([batch_ndx, i, series_uid, _series_uid, seg_candidateInfo_list])
-                    results_list.append((center_t[i], probability_t[i,0].item()))
+                    assert series_uid == _series_uid
+                    results_list.append((center_t[i], probability_t[i, 0].item()))
 
-
-
-            # This part is all about matching up annotations with our segmentation results
+            # Match annotations with segmentation results
             tp = tn = fp = fn = 0
             missed_pos = 0
-            ct = getCt(series_uid)
-            candidateInfo_list = candidateInfo_dict[series_uid]
-            candidateInfo_list = [cit for cit in candidateInfo_list if cit.isNodule_bool]
 
-            found_cit_list = [None] * len(results_list)
+            candidate_list = candidate_dict.get(series_uid, [])
+            candidate_list = [c for c in candidate_list if c.is_nodule]
 
-            for candidateInfo_tup in candidateInfo_list:
+            found_cit_list: list[CandidateInfo | None] = [None] * len(results_list)
+
+            for candidate in candidate_list:
                 min_dist = (999, None)
 
                 for result_ndx, (result_center_irc_t, nodule_probability_t) in enumerate(results_list):
-                    result_center_xyz = irc2xyz(result_center_irc_t, ct.origin_xyz, ct.vxSize_xyz, ct.direction_a)
-                    delta_xyz_t = torch.tensor(result_center_xyz) - torch.tensor(candidateInfo_tup.center_xyz)
+                    result_center_xyz = irc2xyz(
+                        result_center_irc_t,
+                        origin_xyz=ct.metadata.origin_xyz,
+                        vxSize_xyz=ct.metadata.spacing_xyz,
+                        direction_a=ct.metadata.direction,
+                    )
+                    delta_xyz_t = torch.tensor(result_center_xyz) - torch.tensor(candidate.center_xyz)
                     distance_t = (delta_xyz_t ** 2).sum().sqrt()
 
                     min_dist = min(min_dist, (distance_t, result_ndx))
 
-                distance_cutoff = max(10, candidateInfo_tup.diameter_mm / 2)
+                distance_cutoff = max(10, candidate.diameter_mm / 2)
                 if min_dist[0] < distance_cutoff:
                     found_dist, result_ndx = min_dist
+                    if result_ndx is None:
+                        continue
                     nodule_probability_t = results_list[result_ndx][1]
 
-                    assert candidateInfo_tup.isNodule_bool
+                    assert candidate.is_nodule
 
                     if nodule_probability_t > 0.5:
                         tp += 1
                     else:
                         fn += 1
 
-                    found_cit_list[result_ndx] = candidateInfo_tup
-
+                    found_cit_list[result_ndx] = candidate
                 else:
-                    log.warning("!!! Missed positive {}; {} min dist !!!".format(candidateInfo_tup, min_dist))
+                    log.warning(f"!!! Missed positive {candidate}; {min_dist} min dist !!!")
                     missed_pos += 1
                     missed_pos_dist_list.append(float(min_dist[0]))
-                    missed_pos_cit_list.append(candidateInfo_tup)
+                    missed_pos_cit_list.append(candidate)
 
-            # # TODO remove
-            # acceptable_set = {
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.100225287222365663678666836860',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.102681962408431413578140925249',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.195557219224169985110295082004',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.216252660192313507027754194207',
-            #     # '1.3.6.1.4.1.14519.5.2.1.6279.6001.229096941293122177107846044795',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.229096941293122177107846044795',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.299806338046301317870803017534',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.395623571499047043765181005112',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.487745546557477250336016826588',
-            #     '1.3.6.1.4.1.14519.5.2.1.6279.6001.970428941353693253759289796610',
-            # }
-            # if missed_pos > 0 and series_uid not in acceptable_set:
-            #     log.info("Unacceptable series_uid: " + series_uid)
-            #     break
-            #
-            # if total_missed_pos > 10:
-            #     break
-            #
-            #
-            # for result_ndx, (result_center_irc_t, nodule_probability_t) in enumerate(results_list):
-            #     if found_cit_list[result_ndx] is None:
-            #         if nodule_probability_t > 0.5:
-            #             fp += 1
-            #         else:
-            #             tn += 1
-
-
-            log.info("{}: {} missed pos, {} fn, {} fp, {} tp, {} tn".format(series_uid, missed_pos, fn, fp, tp, tn))
+            log.info(f"{series_uid}: {missed_pos} missed pos, {fn} fn, {fp} fp, {tp} tp, {tn} tn")
             total_tp += tp
             total_tn += tn
             total_fp += fp
@@ -352,18 +294,16 @@ class FalsePosRateCheckApp:
         with open(self.cli_args.classification_path, 'rb') as f:
             log.info(self.cli_args.classification_path)
             log.info(hashlib.sha1(f.read()).hexdigest())
-        log.info("{}: {} missed pos, {} fn, {} fp, {} tp, {} tn".format('total', total_missed_pos, total_fn, total_fp, total_tp, total_tn))
-        # missed_pos_dist_list.sort()
-        # log.info("missed_pos_dist_list {}".format(missed_pos_dist_list))
-        for cit, dist in zip(missed_pos_cit_list, missed_pos_dist_list):
-            log.info("    Missed by {}: {}".format(dist, cit))
 
+        log.info(f"total: {total_missed_pos} missed pos, {total_fn} fn, {total_fp} fp, {total_tp} tp, {total_tn} tn")
+        for cit, dist in zip(missed_pos_cit_list, missed_pos_dist_list):
+            log.info(f"    Missed by {dist}: {cit}")
 
     def segmentCt(self, series_uid):
+        """Run segmentation on a CT scan."""
         with torch.no_grad():
-            ct = getCt(series_uid)
-
-            output_g = torch.zeros(ct.hu_a.shape, dtype=torch.float32, device=self.device)
+            ct = self.ct_cache.get_classification(series_uid)
+            output_g = torch.zeros(ct.hu_array.shape, dtype=torch.float32, device=self.device)
 
             seg_dl = self.initSegmentationDl(series_uid)
             for batch_tup in seg_dl:
@@ -373,22 +313,19 @@ class FalsePosRateCheckApp:
                 prediction_g = self.seg_model(input_g)
 
                 for i, slice_ndx in enumerate(slice_ndx_list):
-                    output_g[slice_ndx] = prediction_g[i,0]
+                    output_g[slice_ndx] = prediction_g[i, 0]
 
             mask_g = output_g > 0.5
             clean_g = self.erode(mask_g.unsqueeze(0).unsqueeze(0), 1)[0][0]
 
-            # mask_a = output_a > 0.5
-            # clean_a = morph.binary_erosion(mask_a, iterations=1)
-            # clean_a = morph.binary_dilation(clean_a, iterations=2)
-
         return ct, output_g, mask_g, clean_g
 
     def _make_circle_conv(self, radius):
+        """Create circular convolution kernel."""
         diameter = 1 + radius * 2
 
-        a = torch.linspace(-1, 1, steps=diameter)**2
-        b = (a[None] + a[:, None])**0.5
+        a = torch.linspace(-1, 1, steps=diameter) ** 2
+        b = (a[None] + a[:, None]) ** 0.5
 
         circle_weights = (b <= 1.0).to(torch.float32)
 
@@ -399,89 +336,76 @@ class FalsePosRateCheckApp:
         return conv
 
     def erode(self, input_mask, radius, threshold=1):
+        """Apply erosion to mask."""
         conv = self.conv_list[radius - 1]
         input_float = input_mask.to(torch.float32)
         result = conv(input_float)
 
-        # log.debug(['erode in ', radius, threshold, input_float.min().item(), input_float.mean().item(), input_float.max().item()])
-        # log.debug(['erode out', radius, threshold, result.min().item(), result.mean().item(), result.max().item()])
-
         return result >= threshold
 
-
-    def clusterSegmentationOutput(self, series_uid,  ct, clean_g):
+    def clusterSegmentationOutput(self, series_uid, ct, clean_g):
+        """Cluster segmentation output into candidates."""
         clean_a = clean_g.cpu().numpy()
-        candidateLabel_a, candidate_count = measure.label(clean_a)
-        centerIrc_list = measure.center_of_mass(
-            ct.hu_a.clip(-1000, 1000) + 1001,
+        candidateLabel_a, candidate_count = measure.label(clean_a)  # type: ignore[misc]
+        centerIrc_list = measure.center_of_mass(  # type: ignore[misc]
+            ct.hu_array.clip(-1000, 1000) + 1001,
             labels=candidateLabel_a,
-            index=list(range(1, candidate_count+1)),
+            index=list(range(1, candidate_count + 1)),
         )
 
-        candidateInfo_list = []
+        candidate_list = []
         for i, center_irc in enumerate(centerIrc_list):
-            assert np.isfinite(center_irc).all(), repr([series_uid, i, candidate_count, (ct.hu_a[candidateLabel_a == i+1]).sum(), center_irc])
+            assert np.isfinite(center_irc).all()
             center_xyz = irc2xyz(
                 center_irc,
-                ct.origin_xyz,
-                ct.vxSize_xyz,
-                ct.direction_a,
+                origin_xyz=ct.metadata.origin_xyz,
+                vxSize_xyz=ct.metadata.spacing_xyz,
+                direction_a=ct.metadata.direction,
             )
             diameter_mm = 0.0
-            # pixel_count = (candidateLabel_a == i+1).sum()
-            # area_mm2 = pixel_count * ct.vxSize_xyz[0] * ct.vxSize_xyz[1]
-            # diameter_mm = 2 * (area_mm2 / math.pi) ** 0.5
 
-            candidateInfo_tup = \
-                CandidateInfoTuple(None, None, None, diameter_mm, series_uid, center_xyz)
-            candidateInfo_list.append(candidateInfo_tup)
+            candidate = CandidateInfo(
+                is_nodule=False,
+                has_annotation=False,
+                is_malignant=False,
+                diameter_mm=diameter_mm,
+                series_uid=series_uid,
+                center_xyz=tuple(center_xyz),
+            )
+            candidate_list.append(candidate)
 
-        return candidateInfo_list, centerIrc_list, candidateLabel_a
+        return candidate_list, centerIrc_list, candidateLabel_a
 
-    # def logResults(self, mode_str, filtered_list, series2diagnosis_dict, positive_set):
-    #     count_dict = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
-    #     for series_uid in filtered_list:
-    #         probablity_float, center_irc = series2diagnosis_dict.get(series_uid, (0.0, None))
-    #         if center_irc is not None:
-    #             center_irc = tuple(int(x.item()) for x in center_irc)
-    #         positive_bool = series_uid in positive_set
-    #         prediction_bool = probablity_float > 0.5
-    #         correct_bool = positive_bool == prediction_bool
-    #
-    #         if positive_bool and prediction_bool:
-    #             count_dict['tp'] += 1
-    #         if not positive_bool and not prediction_bool:
-    #             count_dict['tn'] += 1
-    #         if not positive_bool and prediction_bool:
-    #             count_dict['fp'] += 1
-    #         if positive_bool and not prediction_bool:
-    #             count_dict['fn'] += 1
-    #
-    #
-    #         log.info("{} {} Label:{!r:5} Pred:{!r:5} Correct?:{!r:5} Value:{:.4f} {}".format(
-    #             mode_str,
-    #             series_uid,
-    #             positive_bool,
-    #             prediction_bool,
-    #             correct_bool,
-    #             probablity_float,
-    #             center_irc,
-    #         ))
-    #
-    #     total_count = sum(count_dict.values())
-    #     percent_dict = {k: v / (total_count or 1) * 100 for k, v in count_dict.items()}
-    #
-    #     precision = percent_dict['p'] = count_dict['tp'] / ((count_dict['tp'] + count_dict['fp']) or 1)
-    #     recall    = percent_dict['r'] = count_dict['tp'] / ((count_dict['tp'] + count_dict['fn']) or 1)
-    #     percent_dict['f1'] = 2 * (precision * recall) / ((precision + recall) or 1)
-    #
-    #     log.info(mode_str + " tp:{tp:.1f}%, tn:{tn:.1f}%, fp:{fp:.1f}%, fn:{fn:.1f}%".format(
-    #         **percent_dict,
-    #     ))
-    #     log.info(mode_str + " precision:{p:.3f}, recall:{r:.3f}, F1:{f1:.3f}".format(
-    #         **percent_dict,
-    #     ))
 
+class _CandidateDataset(Dataset):
+    """Minimal dataset for classification of detected candidates."""
+
+    CHUNK_SIZE = (32, 48, 48)
+
+    def __init__(self, candidates, config, ct_cache):
+        super().__init__()
+        self.candidates = candidates
+        self.config = config
+        self.ct_cache = ct_cache
+
+    def __len__(self):
+        return len(self.candidates)
+
+    def __getitem__(self, idx):
+        candidate = self.candidates[idx]
+        ct = self.ct_cache.get_classification(candidate.series_uid)
+        chunk, center_irc = ct.extract_chunk(candidate.center_xyz, self.CHUNK_SIZE)
+
+        ct_tensor = torch.from_numpy(chunk).unsqueeze(0).float()
+
+        label = torch.tensor([
+            not candidate.is_nodule,
+            candidate.is_nodule,
+        ], dtype=torch.long)
+
+        label_idx = 1 if candidate.is_nodule else 0
+
+        return ct_tensor, label, label_idx, candidate.series_uid, center_irc
 
 
 if __name__ == '__main__':

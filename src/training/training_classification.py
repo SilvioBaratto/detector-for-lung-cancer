@@ -1,45 +1,76 @@
+"""
+Classification model training application.
+
+Trains nodule classification (nodule vs non-nodule) or
+malignancy classification (benign vs malignant) models.
+
+Design Principles:
+- Dependency Inversion: Dependencies injected via constructor
+- Single Responsibility: Training logic only, logging/checkpointing delegated
+"""
+
 import argparse
 import datetime
-import hashlib
-import os
-import shutil
-import sys
-
-import sys
-sys.path.append("..")
+from typing import Optional
 
 import numpy as np
 from matplotlib import pyplot
 
-from torch.utils.tensorboard import SummaryWriter
-
 import torch
 import torch.nn as nn
-from torch.optim import SGD, Adam
+from torch.optim import SGD
 from torch.utils.data import DataLoader
 
-import dataset.dsets_classification as dataset
-import model.model_classification as model
-
+from config import Config, get_config
+from dataset import (
+    ClassificationDataset,
+    MalignancyDataset,
+    Augmentation3D,
+)
+from model.model_classification import get_model, list_models
+from training.losses import CrossEntropyLoss, LossStrategy
+from training.metrics import ClassificationMetricsCalculator
+from training.checkpointing import ModelCheckpointer, create_checkpointer
+from training.logging import TrainingLogger, create_training_logger
 from util.util import enumerateWithEstimate
+from util.device import get_best_device, get_num_workers, is_mps_device
 from util.logconf import logging
 
 
 log = logging.getLogger(__name__)
-# log.setLevel(logging.WARN)
 log.setLevel(logging.INFO)
-log.setLevel(logging.DEBUG)
 
-# Used for computeBatchLoss and logMetrics to index into metrics_t/metrics_a
-METRICS_LABEL_NDX=0
-METRICS_PRED_NDX=1
-METRICS_PRED_P_NDX=2
-METRICS_LOSS_NDX=3
+# Metrics indices for backward compatibility
+METRICS_LABEL_NDX = 0
+METRICS_PRED_NDX = 1
+METRICS_PRED_P_NDX = 2
+METRICS_LOSS_NDX = 3
 METRICS_SIZE = 4
 
+
 class ClassificationTrainingApp:
-    def __init__(self, sys_argv=None):
+    """
+    Training application for classification models.
+
+    Supports dependency injection for testing and flexibility:
+    - model: Classification model (default: MIFNet via registry)
+    - loss_fn: Loss function (default: CrossEntropyLoss)
+    - logger: Training logger (default: TensorBoard)
+    - checkpointer: Model checkpointer (default: ModelCheckpointer)
+    """
+
+    def __init__(
+        self,
+        sys_argv: Optional[list[str]] = None,
+        # Dependency injection
+        config: Optional[Config] = None,
+        model: Optional[nn.Module] = None,
+        loss_fn: Optional[LossStrategy] = None,
+        logger: Optional[TrainingLogger] = None,
+        checkpointer: Optional[ModelCheckpointer] = None,
+    ):
         if sys_argv is None:
+            import sys
             sys_argv = sys.argv[1:]
 
         parser = argparse.ArgumentParser()
@@ -50,23 +81,13 @@ class ClassificationTrainingApp:
         )
         parser.add_argument('--num-workers',
             help='Number of worker processes for background data loading',
-            default=48,
+            default=8,
             type=int,
         )
         parser.add_argument('--epochs',
             help='Number of epochs to train for',
             default=1,
             type=int,
-        )
-        parser.add_argument('--dataset',
-            help="What to dataset to feed the model.",
-            action='store',
-            default='LunaDataset',
-        )
-        parser.add_argument('--model',
-            help="What to model class name to use.",
-            action='store',
-            default='LunaModel',
         )
         parser.add_argument('--malignant',
             help="Train the model to classify nodules as benign or malignant.",
@@ -84,7 +105,12 @@ class ClassificationTrainingApp:
         )
         parser.add_argument('--tb-prefix',
             default='classification',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
+            help="Data prefix to use for Tensorboard run.",
+        )
+        parser.add_argument('--model',
+            default='mifnet',
+            choices=list_models(),
+            help="Model architecture to use (default: mifnet for lightweight)",
         )
         parser.add_argument('comment',
             help="Comment suffix for Tensorboard run.",
@@ -95,34 +121,54 @@ class ClassificationTrainingApp:
         self.cli_args = parser.parse_args(sys_argv)
         self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H.%M.%S')
 
-        self.trn_writer = None
-        self.val_writer = None
+        # Use injected config or create default
+        self.config = config or get_config()
+
         self.totalTrainingSamples_count = 0
 
-        self.augmentation_dict = {}
-        if True:    # These values were empirically chosen to have a reasonable impact, but better
-                    # values probably exist
-        # if self.cli_args.augmented or self.cli_args.augment_flip:
-            self.augmentation_dict['flip'] = True   
-        # if self.cli_args.augmented or self.cli_args.augment_offset:
-            self.augmentation_dict['offset'] = 0.1  
-        # if self.cli_args.augmented or self.cli_args.augment_scale:
-            self.augmentation_dict['scale'] = 0.2
-        # if self.cli_args.augmented or self.cli_args.augment_rotate:
-            self.augmentation_dict['rotate'] = True
-        # if self.cli_args.augmented or self.cli_args.augment_noise:
-            self.augmentation_dict['noise'] = 25.0
+        # Augmentation settings
+        self.augmentation = Augmentation3D(
+            flip=True,
+            offset=0.1,
+            scale=0.2,
+            rotate=True,
+            noise=25.0,
+        )
 
-        self.use_cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda" if self.use_cuda else "cpu")
+        # Device setup (MPS > CUDA > CPU)
+        self.device = get_best_device()
+        self.use_cuda = self.device.type in ('cuda', 'mps')
 
-        self.model = self.initModel()
+        # Dependency injection with defaults
+        self.model = model or self.initModel()
         self.optimizer = self.initOptimizer()
+        self.loss_fn = loss_fn or CrossEntropyLoss()
+        self.metrics_calculator = ClassificationMetricsCalculator()
 
+        # Initialize logger (injected or created)
+        self.logger = logger or create_training_logger(
+            base_dir="runs",
+            tb_prefix=self.cli_args.tb_prefix,
+            time_str=self.time_str,
+            comment=self.cli_args.comment,
+            mode="cls",
+        )
+
+        # Initialize checkpointer (injected or created)
+        model_type = 'mal' if self.cli_args.malignant else 'cls'
+        self.checkpointer = checkpointer or create_checkpointer(
+            base_dir="../../models",
+            tb_prefix=self.cli_args.tb_prefix,
+            model_type=model_type,
+            time_str=self.time_str,
+            comment=self.cli_args.comment,
+        )
 
     def initModel(self):
-        model_cls = getattr(model, self.cli_args.model)
-        cls_model = model_cls()
+        """Initialize the classification model."""
+        model_name = self.cli_args.model
+        log.info(f"Initializing model: {model_name}")
+        cls_model = get_model(model_name)
 
         if self.cli_args.finetune:
             d = torch.load(self.cli_args.finetune, map_location='cpu')
@@ -131,10 +177,11 @@ class ClassificationTrainingApp:
                 if len(list(subm.parameters())) > 0
             ]
             finetune_blocks = model_blocks[-self.cli_args.finetune_depth:]
-            log.info(f"finetuning from {self.cli_args.finetune}, blocks {' '.join(finetune_blocks)}")
+            log.info(f"Finetuning from {self.cli_args.finetune}, blocks {' '.join(finetune_blocks)}")
+
             cls_model.load_state_dict(
                 {
-                    k: v for k,v in d['model_state'].items()
+                    k: v for k, v in d['model_state'].items()
                     if k.split('.')[0] not in model_blocks[-1]
                 },
                 strict=False,
@@ -142,90 +189,88 @@ class ClassificationTrainingApp:
             for n, p in cls_model.named_parameters():
                 if n.split('.')[0] not in finetune_blocks:
                     p.requires_grad_(False)
+
         if self.use_cuda:
-            log.info("Using CUDA; {} devices.".format(torch.cuda.device_count()))
-            if torch.cuda.device_count() > 1:
-                cls_model = nn.DataParallel(cls_model)
+            if self.device.type == 'cuda':
+                log.info(f"Using CUDA; {torch.cuda.device_count()} devices.")
+                if torch.cuda.device_count() > 1:
+                    cls_model = nn.DataParallel(cls_model)
+            elif is_mps_device(self.device):
+                log.info("Using MPS (Apple Silicon)")
             cls_model = cls_model.to(self.device)
+
         return cls_model
 
     def initOptimizer(self):
+        """Initialize the optimizer."""
         lr = 0.003 if self.cli_args.finetune else 0.001
         return SGD(self.model.parameters(), lr=lr, weight_decay=1e-4)
-        #return Adam(self.model.parameters(), lr=3e-4)
 
     def initTrainDl(self):
-        ds_cls = getattr(dataset, self.cli_args.dataset)    # our custom dataset
+        """Initialize training data loader."""
+        DatasetClass = MalignancyDataset if self.cli_args.malignant else ClassificationDataset
 
-        train_ds = ds_cls(
+        train_ds = DatasetClass(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=False,
-            ratio_int=1,
+            is_validation=False,
+            balance_ratio=1,
+            augmentation=self.augmentation,
         )
 
         batch_size = self.cli_args.batch_size
-        if self.use_cuda:
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
             batch_size *= torch.cuda.device_count()
 
-        train_dl = DataLoader(  # An. off-the-shelf class
+        return DataLoader(
             train_ds,
-            batch_size=batch_size,  # batching is done automatically
+            batch_size=batch_size,
             num_workers=self.cli_args.num_workers,
-            pin_memory=self.use_cuda,   # Pinned memory transfers to GPU quickly
+            pin_memory=self.use_cuda,
         )
-
-        return train_dl
 
     def initValDl(self):
-        ds_cls = getattr(dataset, self.cli_args.dataset)
+        """Initialize validation data loader."""
+        DatasetClass = MalignancyDataset if self.cli_args.malignant else ClassificationDataset
 
-        val_ds = ds_cls(
+        val_ds = DatasetClass(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=True,
+            is_validation=True,
         )
 
         batch_size = self.cli_args.batch_size
-        if self.use_cuda:
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
             batch_size *= torch.cuda.device_count()
 
-        val_dl = DataLoader(
+        return DataLoader(
             val_ds,
             batch_size=batch_size,
             num_workers=self.cli_args.num_workers,
             pin_memory=self.use_cuda,
         )
 
-        return val_dl
-
     def initTensorboardWriters(self):
-        if self.trn_writer is None:
-            log_dir = os.path.join('runs', self.cli_args.tb_prefix,
-                                   self.time_str)
-
-            self.trn_writer = SummaryWriter(
-                log_dir=log_dir + '-trn_cls-' + self.cli_args.comment)
-            self.val_writer = SummaryWriter(
-                log_dir=log_dir + '-val_cls-' + self.cli_args.comment)
-
+        """Initialize TensorBoard writers (now delegated to logger)."""
+        # Logger is initialized in __init__, this is kept for compatibility
+        pass
 
     def main(self):
-        log.info("Starting {}, {}".format(type(self).__name__, self.cli_args))
+        """Main training loop."""
+        log.info(f"Starting {type(self).__name__}, {self.cli_args}")
 
         train_dl = self.initTrainDl()
-        val_dl = self.initValDl()   # The validation data loader is very similar to training
+        val_dl = self.initValDl()
 
         best_score = 0.0
         validation_cadence = 5 if not self.cli_args.finetune else 1
-        for epoch_ndx in range(1, self.cli_args.epochs + 1):
 
-            log.info("Epoch {} of {}, {}/{} batches of size {}*{}".format(
-                epoch_ndx,
-                self.cli_args.epochs,
-                len(train_dl),
-                len(val_dl),
-                self.cli_args.batch_size,
-                (torch.cuda.device_count() if self.use_cuda else 1),
-            ))
+        for epoch_ndx in range(1, self.cli_args.epochs + 1):
+            log.info(
+                f"Epoch {epoch_ndx} of {self.cli_args.epochs}, "
+                f"{len(train_dl)}/{len(val_dl)} batches of size "
+                f"{self.cli_args.batch_size}*{torch.cuda.device_count() if self.use_cuda else 1}"
+            )
 
             trnMetrics_t = self.doTraining(epoch_ndx, train_dl)
             self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
@@ -235,51 +280,50 @@ class ClassificationTrainingApp:
                 score = self.logMetrics(epoch_ndx, 'val', valMetrics_t)
                 best_score = max(score, best_score)
 
-                # TODO: this 'cls' will need to change for the malignant classifier
-                self.saveModel('cls', epoch_ndx, score == best_score)
+                model_type = 'mal' if self.cli_args.malignant else 'cls'
+                self.saveModel(model_type, epoch_ndx, score == best_score)
 
-
-        if hasattr(self, 'trn_writer'):
-            self.trn_writer.close()
-            self.val_writer.close()
-
+        # Close the logger
+        self.logger.close()
 
     def doTraining(self, epoch_ndx, train_dl):
+        """Execute one training epoch."""
         self.model.train()
-        train_dl.dataset.shuffleSamples()
-        trnMetrics_g = torch.zeros( # Initilizes an empty metrics array
+        train_dl.dataset.shuffle()
+
+        trnMetrics_g = torch.zeros(
             METRICS_SIZE,
             len(train_dl.dataset),
             device=self.device,
         )
 
-        batch_iter = enumerateWithEstimate( # sets up our batch looping with time estimate
+        batch_iter = enumerateWithEstimate(
             train_dl,
-            "E{} Training".format(epoch_ndx),
+            f"E{epoch_ndx} Training",
             start_ndx=train_dl.num_workers,
         )
+
         for batch_ndx, batch_tup in batch_iter:
-            self.optimizer.zero_grad()  # Frees any leftover gradient tensors
+            self.optimizer.zero_grad()
 
             loss_var = self.computeBatchLoss(
                 batch_ndx,
                 batch_tup,
                 train_dl.batch_size,
                 trnMetrics_g,
-                augment=True
+                augment=True,
             )
 
-            loss_var.backward()     # Actually updates the model weights
+            loss_var.backward()
             self.optimizer.step()
 
         self.totalTrainingSamples_count += len(train_dl.dataset)
-
         return trnMetrics_g.to('cpu')
 
-
     def doValidation(self, epoch_ndx, val_dl):
+        """Execute validation."""
         with torch.no_grad():
-            self.model.eval()   # Turns off training-time behaviour
+            self.model.eval()
             valMetrics_g = torch.zeros(
                 METRICS_SIZE,
                 len(val_dl.dataset),
@@ -288,241 +332,163 @@ class ClassificationTrainingApp:
 
             batch_iter = enumerateWithEstimate(
                 val_dl,
-                "E{} Validation ".format(epoch_ndx),
+                f"E{epoch_ndx} Validation",
                 start_ndx=val_dl.num_workers,
             )
+
             for batch_ndx, batch_tup in batch_iter:
                 self.computeBatchLoss(
                     batch_ndx,
                     batch_tup,
                     val_dl.batch_size,
                     valMetrics_g,
-                    augment=False
+                    augment=False,
                 )
 
         return valMetrics_g.to('cpu')
 
-
-
-    def computeBatchLoss(self, batch_ndx, batch_tup, batch_size, metrics_g,
-                         augment=True):
+    def computeBatchLoss(self, batch_ndx, batch_tup, batch_size, metrics_g, augment=True):
+        """Compute loss for a batch."""
         input_t, label_t, index_t, _series_list, _center_list = batch_tup
 
         input_g = input_t.to(self.device, non_blocking=True)
         label_g = label_t.to(self.device, non_blocking=True)
         index_g = index_t.to(self.device, non_blocking=True)
 
-
         if augment:
-            input_g = model.augment3d(input_g)
+            input_g = self.augmentation(input_g)
 
-        logits_g, probability_g = self.model(input_g)   
+        logits_g, probability_g = self.model(input_g)
 
-        loss_g = nn.functional.cross_entropy(logits_g, label_g[:, 1],   # Reduction = 'none' gives the loss per sample
-                                             reduction="none")
+        loss_g = self.loss_fn(
+            logits_g, label_g[:, 1],
+            reduction="none",
+        )
+
         start_ndx = batch_ndx * batch_size
         end_ndx = start_ndx + label_t.size(0)
 
-        _, predLabel_g = torch.max(probability_g, dim=1, keepdim=False,
-                                   out=None)
+        _, predLabel_g = torch.max(probability_g, dim=1, keepdim=False)
 
         metrics_g[METRICS_LABEL_NDX, start_ndx:end_ndx] = index_g
         metrics_g[METRICS_PRED_NDX, start_ndx:end_ndx] = predLabel_g
-
-        metrics_g[METRICS_PRED_P_NDX, start_ndx:end_ndx] = probability_g[:,1]
-
+        metrics_g[METRICS_PRED_P_NDX, start_ndx:end_ndx] = probability_g[:, 1]
         metrics_g[METRICS_LOSS_NDX, start_ndx:end_ndx] = loss_g
 
-        return loss_g.mean()    # This is the loss over the entire batch
+        return loss_g.mean()
 
+    def logMetrics(self, epoch_ndx, mode_str, metrics_t):
+        """Log metrics to TensorBoard and console."""
+        log.info(f"E{epoch_ndx} {type(self).__name__}")
 
-    def logMetrics(
-            self,
-            epoch_ndx,
-            mode_str,
-            metrics_t,
-            classificationThreshold=0.5,
-    ):
-        self.initTensorboardWriters()
-        log.info("E{} {}".format(
-            epoch_ndx,
-            type(self).__name__,
-        ))
-
-        if self.cli_args.dataset == 'MalignantLunaDataset':
-            pos = 'mal'
-            neg = 'ben'
-        else:
-            pos = 'pos'
-            neg = 'neg'
-
+        pos = 'mal' if self.cli_args.malignant else 'pos'
+        neg = 'ben' if self.cli_args.malignant else 'neg'
 
         negLabel_mask = metrics_t[METRICS_LABEL_NDX] == 0
         negPred_mask = metrics_t[METRICS_PRED_NDX] == 0
-
         posLabel_mask = ~negLabel_mask
         posPred_mask = ~negPred_mask
 
-        neg_count = int(negLabel_mask.sum())    # convert to a normal Python Integer
+        neg_count = int(negLabel_mask.sum())
         pos_count = int(posLabel_mask.sum())
-
         neg_correct = int((negLabel_mask & negPred_mask).sum())
         pos_correct = int((posLabel_mask & posPred_mask).sum())
 
-        trueNeg_count = neg_correct
         truePos_count = pos_correct
-
         falsePos_count = neg_count - neg_correct
         falseNeg_count = pos_count - pos_correct
 
         metrics_dict = {}
-        metrics_dict['loss/all'] = metrics_t[METRICS_LOSS_NDX].mean()
-        metrics_dict['loss/neg'] = metrics_t[METRICS_LOSS_NDX, negLabel_mask].mean()
-        metrics_dict['loss/pos'] = metrics_t[METRICS_LOSS_NDX, posLabel_mask].mean()
+        metrics_dict['loss/all'] = float(metrics_t[METRICS_LOSS_NDX].mean())
+        metrics_dict['loss/neg'] = float(metrics_t[METRICS_LOSS_NDX, negLabel_mask].mean())
+        metrics_dict['loss/pos'] = float(metrics_t[METRICS_LOSS_NDX, posLabel_mask].mean())
 
         metrics_dict['correct/all'] = (pos_correct + neg_correct) / metrics_t.shape[1] * 100
-        metrics_dict['correct/neg'] = (neg_correct) / neg_count * 100
-        metrics_dict['correct/pos'] = (pos_correct) / pos_count * 100
+        metrics_dict['correct/neg'] = neg_correct / neg_count * 100
+        metrics_dict['correct/pos'] = pos_correct / pos_count * 100
 
         precision = metrics_dict['pr/precision'] = \
             truePos_count / np.float64(truePos_count + falsePos_count)
-        recall    = metrics_dict['pr/recall'] = \
+        recall = metrics_dict['pr/recall'] = \
             truePos_count / np.float64(truePos_count + falseNeg_count)
+        metrics_dict['pr/f1_score'] = 2 * (precision * recall) / (precision + recall)
 
-        metrics_dict['pr/f1_score'] = \
-            2 * (precision * recall) / (precision + recall)
-
+        # ROC curve and AUC
         threshold = torch.linspace(1, 0, steps=89)
-        
         tpr = (metrics_t[None, METRICS_PRED_P_NDX, posLabel_mask] >= threshold[:, None]).sum(1).float() / pos_count
         fpr = (metrics_t[None, METRICS_PRED_P_NDX, negLabel_mask] >= threshold[:, None]).sum(1).float() / neg_count
-        fp_diff = fpr[1:]-fpr[:-1]
-        tp_avg  = (tpr[1:]+tpr[:-1])/2
-        auc = (fp_diff * tp_avg).sum()
+        fp_diff = fpr[1:] - fpr[:-1]
+        tp_avg = (tpr[1:] + tpr[:-1]) / 2
+        auc = float((fp_diff * tp_avg).sum())
         metrics_dict['auc'] = auc
 
-        log.info(  
-            ("E{} {:8} {loss/all:.4f} loss, "
-                 + "{correct/all:-5.1f}% correct, "
-                 + "{pr/precision:.4f} precision, " # format string updated
-                 + "{pr/recall:.4f} recall, "       # format string updated
-                 + "{pr/f1_score:.4f} f1 score, "   # format string updated
-                 + "{auc:.4f} auc"
-            ).format(
-                epoch_ndx,
-                mode_str,
-                **metrics_dict,
-            )
-        )
         log.info(
-            ("E{} {:8} {loss/neg:.4f} loss, "
-                 + "{correct/neg:-5.1f}% correct ({neg_correct:} of {neg_count:})"
-            ).format(
-                epoch_ndx,
-                mode_str + '_' + neg,
-                neg_correct=neg_correct,
-                neg_count=neg_count,
-                **metrics_dict,
-            )
-        )
-        log.info(
-            ("E{} {:8} {loss/pos:.4f} loss, "
-                 + "{correct/pos:-5.1f}% correct ({pos_correct:} of {pos_count:})"
-            ).format(
-                epoch_ndx,
-                mode_str + '_' + pos,
-                pos_correct=pos_correct,
-                pos_count=pos_count,
-                **metrics_dict,
-            )
+            f"E{epoch_ndx} {mode_str:8} {metrics_dict['loss/all']:.4f} loss, "
+            f"{metrics_dict['correct/all']:-5.1f}% correct, "
+            f"{metrics_dict['pr/precision']:.4f} precision, "
+            f"{metrics_dict['pr/recall']:.4f} recall, "
+            f"{metrics_dict['pr/f1_score']:.4f} f1 score, "
+            f"{auc:.4f} auc"
         )
 
-        writer = getattr(self, mode_str + '_writer')
+        # Use injected logger
+        step = self.totalTrainingSamples_count
 
-        for key, value in metrics_dict.items():
-            key = key.replace('pos', pos)
-            key = key.replace('neg', neg)
-            writer.add_scalar(key, value, self.totalTrainingSamples_count)
-
-        fig = pyplot.figure()
-        pyplot.plot(fpr, tpr)
-        writer.add_figure('roc', fig, self.totalTrainingSamples_count)
-
-        writer.add_scalar('auc', auc, self.totalTrainingSamples_count)
-
-        bins = np.linspace(0, 1)
-
-        writer.add_histogram(
-            'label_neg',
-            metrics_t[METRICS_PRED_P_NDX, negLabel_mask],
-            self.totalTrainingSamples_count,
-            bins=bins
-        )
-        writer.add_histogram(
-            'label_pos',
-            metrics_t[METRICS_PRED_P_NDX, posLabel_mask],
-            self.totalTrainingSamples_count,
-            bins=bins
-        )
-
-        if not self.cli_args.malignant:
-            score = metrics_dict['pr/f1_score']
-        else:
-            score = metrics_dict['auc']
-
-        return score
-
-    def saveModel(self, type_str, epoch_ndx, isBest=False):
-        file_path = os.path.join(
-            '..',
-            '..',
-            'models',
-            self.cli_args.tb_prefix,
-            '{}_{}_{}.{}.state'.format(
-                type_str,
-                self.time_str,
-                self.cli_args.comment,
-                self.totalTrainingSamples_count,
-            )
-        )
-
-        os.makedirs(os.path.dirname(file_path), mode=0o755, exist_ok=True)
-
-        model = self.model
-        if isinstance(model, torch.nn.DataParallel):
-            model = model.module
-
-        state = {
-            'model_state': model.state_dict(),
-            'model_name': type(model).__name__,
-            'optimizer_state' : self.optimizer.state_dict(),
-            'optimizer_name': type(self.optimizer).__name__,
-            'epoch': epoch_ndx,
-            'totalTrainingSamples_count': self.totalTrainingSamples_count,
+        # Replace pos/neg with appropriate labels
+        renamed_metrics = {
+            k.replace('pos', pos).replace('neg', neg): v
+            for k, v in metrics_dict.items()
         }
-        torch.save(state, file_path)
 
-        log.debug("Saved model params to {}".format(file_path))
-
-        if isBest:
-            best_path = os.path.join(
-                '..',
-                '..',
-                'models',
-                self.cli_args.tb_prefix,
-                '{}_{}_{}.{}.state'.format(
-                    type_str,
-                    self.time_str,
-                    self.cli_args.comment,
-                    'best',
-                )
+        if mode_str == 'trn':
+            self.logger.log_training_metrics(renamed_metrics, step)
+            # Log ROC figure
+            fig = pyplot.figure()
+            pyplot.plot(fpr.numpy(), tpr.numpy())
+            self.logger.log_training_figure('roc', fig, step)
+            pyplot.close(fig)
+            # Log histograms
+            bins = np.linspace(0, 1)
+            self.logger.log_training_histogram(
+                f'label_{neg}', metrics_t[METRICS_PRED_P_NDX, negLabel_mask], step, bins
             )
-            shutil.copyfile(file_path, best_path)
+            self.logger.log_training_histogram(
+                f'label_{pos}', metrics_t[METRICS_PRED_P_NDX, posLabel_mask], step, bins
+            )
+        else:
+            self.logger.log_validation_metrics(renamed_metrics, step)
+            # Log ROC figure
+            fig = pyplot.figure()
+            pyplot.plot(fpr.numpy(), tpr.numpy())
+            self.logger.log_validation_figure('roc', fig, step)
+            pyplot.close(fig)
+            # Log histograms
+            bins = np.linspace(0, 1)
+            self.logger.log_validation_histogram(
+                f'label_{neg}', metrics_t[METRICS_PRED_P_NDX, negLabel_mask], step, bins
+            )
+            self.logger.log_validation_histogram(
+                f'label_{pos}', metrics_t[METRICS_PRED_P_NDX, posLabel_mask], step, bins
+            )
 
-            log.debug("Saved model params to {}".format(best_path))
+        return metrics_dict['auc'] if self.cli_args.malignant else metrics_dict['pr/f1_score']
 
-        with open(file_path, 'rb') as f:
-            log.info("SHA1: " + hashlib.sha1(f.read()).hexdigest())
+    def saveModel(self, _type_str, epoch_ndx, isBest=False):
+        """Save model checkpoint using injected checkpointer."""
+        metrics = {
+            'epoch': epoch_ndx,
+            'total_samples': self.totalTrainingSamples_count,
+        }
+
+        self.checkpointer.save(
+            model=self.model,
+            optimizer=self.optimizer,
+            epoch=epoch_ndx,
+            total_samples=self.totalTrainingSamples_count,
+            metrics=metrics,
+            is_best=isBest,
+        )
+
 
 if __name__ == '__main__':
     ClassificationTrainingApp().main()

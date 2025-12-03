@@ -1,0 +1,22 @@
+# Deep Learning Framework
+torch>=2.9.1
+torchvision>=0.24.1
+
+# Scientific Computing
+numpy>=2.3.5
+scipy>=1.10.0
+
+# Medical Imaging
+SimpleITK>=2.5.3
+
+# Visualization
+matplotlib>=3.10.0
+tensorboard>=2.20.0
+
+# Caching
+diskcache>=5.6.3
+cassandra-driver>=3.29.3
+
+# Utilities
+requests>=2.32.5
+tqdm>=4.67.1

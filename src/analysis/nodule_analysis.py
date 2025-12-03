@@ -1,3 +1,12 @@
+"""
+End-to-end nodule analysis application.
+
+Runs the complete detection pipeline:
+1. Segmentation - U-Net identifies candidate regions
+2. Classification - CNN classifies candidates as nodule vs non-nodule
+3. Malignancy - (optional) Classifies nodules as benign vs malignant
+"""
+
 import argparse
 import glob
 import os
@@ -9,31 +18,30 @@ import scipy.ndimage.morphology as morphology
 
 import torch
 import torch.nn as nn
-import torch.optim
 
-import sys
-sys.path.append("..")
+from torch.utils.data import DataLoader, Dataset
 
-from torch.utils.data import DataLoader
-
-from util.util import enumerateWithEstimate
-from dataset.dsets_segmentation import Luna2dSegmentationDataset
-from dataset.dsets_classification import LunaDataset, getCt, getCandidateInfoDict, getCandidateInfoList, CandidateInfoTuple
-from model.model_segmentation import UNetWrapper
-
-import model.model_classification as model
-
+from config import get_config
+from dataset import (
+    CandidateInfo,
+    SegmentationDataset,
+    ClassificationDataset,
+    get_candidate_repository,
+    get_ct_cache,
+)
+from model.model_segmentation import get_segmentation_model
+from model.model_classification import get_model
+from util.util import enumerateWithEstimate, irc2xyz
 from util.logconf import logging
-from util.util import xyz2irc, irc2xyz
 
 log = logging.getLogger(__name__)
-# log.setLevel(logging.WARN)
-# log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
-logging.getLogger("dsets_segmentation").setLevel(logging.WARNING)
-logging.getLogger("dsets_classification").setLevel(logging.WARNING)
+logging.getLogger("segmentation").setLevel(logging.WARNING)
+logging.getLogger("classification").setLevel(logging.WARNING)
+
 
 def print_confusion(label, confusions, do_mal):
+    """Print confusion matrix."""
     row_labels = ['Non-Nodules', 'Benign', 'Malignant']
 
     if do_mal:
@@ -42,6 +50,7 @@ def print_confusion(label, confusions, do_mal):
         col_labels = ['', 'Complete Miss', 'Filtered Out', 'Pred. Nodule']
         confusions[:, -2] += confusions[:, -1]
         confusions = confusions[:, :-1]
+
     cell_width = 16
     f = '{:>' + str(cell_width) + '}'
     print(label)
@@ -50,39 +59,48 @@ def print_confusion(label, confusions, do_mal):
         r = [l] + list(r)
         if i == 0:
             r[1] = ''
-        print(' | '.join([f.format(i) for i in r]))
+        print(' | '.join([f.format(item) for item in r]))
+
 
 def match_and_score(detections, truth, threshold=0.5, threshold_mal=0.5):
-    # Returns 3x4 confusion matrix for:
-    # Rows: Truth: Non-Nodules, Benign, Malignant
-    # Cols: Not Detected, Detected by Seg, Detected as Benign, Detected as Malignant
-    # If one true nodule matches multiple detections, the "highest" detection is considered
-    # If one detection matches several true nodule annotations, it counts for all of them
-    true_nodules = [c for c in truth if c.isNodule_bool]
+    """
+    Match detections to ground truth and compute confusion matrix.
+
+    Returns 3x4 confusion matrix:
+    - Rows: Truth: Non-Nodules, Benign, Malignant
+    - Cols: Not Detected, Detected by Seg, Detected as Benign, Detected as Malignant
+    """
+    true_nodules = [c for c in truth if c.is_nodule]
     truth_diams = np.array([c.diameter_mm for c in true_nodules])
     truth_xyz = np.array([c.center_xyz for c in true_nodules])
 
     detected_xyz = np.array([n[2] for n in detections])
-    # detection classes will contain
+    # Detection classes:
     # 1 -> detected by seg but filtered by cls
-    # 2 -> detected as benign nodule (or nodule if no malignancy model is used)
-    # 3 -> detected as malignant nodule (if applicable)
-    detected_classes = np.array([1 if d[0] < threshold
-                                 else (2 if d[1] < threshold
-                                       else 3) for d in detections])
+    # 2 -> detected as benign nodule (or nodule if no malignancy model)
+    # 3 -> detected as malignant nodule
+    detected_classes = np.array([
+        1 if d[0] < threshold else (2 if d[1] < threshold_mal else 3)
+        for d in detections
+    ])
 
-    confusion = np.zeros((3, 4), dtype=np.int)
+    confusion = np.zeros((3, 4), dtype=np.int_)
+
     if len(detected_xyz) == 0:
         for tn in true_nodules:
-            confusion[2 if tn.isMal_bool else 1, 0] += 1
+            confusion[2 if tn.is_malignant else 1, 0] += 1
     elif len(truth_xyz) == 0:
         for dc in detected_classes:
             confusion[0, dc] += 1
     else:
-        normalized_dists = np.linalg.norm(truth_xyz[:, None] - detected_xyz[None], ord=2, axis=-1) / truth_diams[:, None]
-        matches = (normalized_dists < 0.7)
-        unmatched_detections = np.ones(len(detections), dtype=np.bool)
-        matched_true_nodules = np.zeros(len(true_nodules), dtype=np.int)
+        normalized_dists = (
+            np.linalg.norm(truth_xyz[:, None] - detected_xyz[None], ord=2, axis=-1)
+            / truth_diams[:, None]
+        )
+        matches = normalized_dists < 0.7
+        unmatched_detections = np.ones(len(detections), dtype=np.bool_)
+        matched_true_nodules = np.zeros(len(true_nodules), dtype=np.int_)
+
         for i_tn, i_detection in zip(*matches.nonzero()):
             matched_true_nodules[i_tn] = max(matched_true_nodules[i_tn], detected_classes[i_detection])
             unmatched_detections[i_detection] = False
@@ -91,10 +109,14 @@ def match_and_score(detections, truth, threshold=0.5, threshold_mal=0.5):
             if ud:
                 confusion[0, dc] += 1
         for tn, dc in zip(true_nodules, matched_true_nodules):
-            confusion[2 if tn.isMal_bool else 1, dc] += 1
+            confusion[2 if tn.is_malignant else 1, dc] += 1
+
     return confusion
 
+
 class NoduleAnalysisApp:
+    """End-to-end nodule analysis application."""
+
     def __init__(self, sys_argv=None):
         if sys_argv is None:
             log.debug(sys.argv)
@@ -102,7 +124,7 @@ class NoduleAnalysisApp:
 
         parser = argparse.ArgumentParser()
         parser.add_argument('--batch-size',
-            help='Batch size to use for training',
+            help='Batch size to use for inference',
             default=4,
             type=int,
         )
@@ -111,52 +133,45 @@ class NoduleAnalysisApp:
             default=48,
             type=int,
         )
-
         parser.add_argument('--run-validation',
             help='Run over validation rather than a single CT.',
             action='store_true',
             default=False,
         )
         parser.add_argument('--include-train',
-            help="Include data that was in the training set. (default: validation data only)",
+            help="Include data that was in the training set.",
             action='store_true',
             default=False,
         )
-
         parser.add_argument('--segmentation-path',
             help="Path to the saved segmentation model",
             nargs='?',
             default='../../models/segmentation/seg_2022-07-21_17.29.23_final_seg.best.state',
         )
-
         parser.add_argument('--cls-model',
-            help="What to model class name to use for the classifier.",
+            help="Model class name to use for the classifier.",
             action='store',
-            default='LunaModel',
+            default='mifnet',
         )
         parser.add_argument('--classification-path',
             help="Path to the saved classification model",
             nargs='?',
             default='../../models/classification/cls_2022-07-21_19.09.18_nodule-nonnodule.best.state',
         )
-
         parser.add_argument('--malignancy-model',
-            help="What to model class name to use for the malignancy classifier.",
+            help="Model class name to use for the malignancy classifier.",
             action='store',
-            default='LunaModel',
-            # default='ModifiedLunaModel',
+            default='mifnet',
         )
         parser.add_argument('--malignancy-path',
             help="Path to the saved malignancy classification model",
             nargs='?',
             default='../../models/classification/cls_2022-07-22_10.25.28_malben-finetune-twolayer.best.state',
         )
-
         parser.add_argument('--tb-prefix',
             default='nodule_analysis',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
+            help="Data prefix to use for Tensorboard run.",
         )
-
         parser.add_argument('series_uid',
             nargs='?',
             default=None,
@@ -164,73 +179,66 @@ class NoduleAnalysisApp:
         )
 
         self.cli_args = parser.parse_args(sys_argv)
-        # self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+        self.config = get_config()
 
         if not (bool(self.cli_args.series_uid) ^ self.cli_args.run_validation):
-            raise Exception("One and only one of series_uid and --run-validation should be given")
-
+            raise ValueError("One and only one of series_uid and --run-validation should be given")
 
         self.use_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
 
+        # Initialize model paths if not provided
         if not self.cli_args.segmentation_path:
             self.cli_args.segmentation_path = self.initModelPath('seg')
-
         if not self.cli_args.classification_path:
             self.cli_args.classification_path = self.initModelPath('cls')
 
         self.seg_model, self.cls_model, self.malignancy_model = self.initModels()
 
+        # Initialize data access
+        self.candidate_repo = get_candidate_repository(self.config)
+        self.ct_cache = get_ct_cache(self.config)
+
     def initModelPath(self, type_str):
+        """Find model path by pattern matching."""
         local_path = os.path.join(
-            '..',
-            '..',
-            'models',
-            type_str + '_{}_{}.{}.state'.format('*', '*', 'best'),
+            '..', '..', 'models',
+            f'{type_str}_*_*.best.state',
         )
 
         file_list = glob.glob(local_path)
         if not file_list:
             pretrained_path = os.path.join(
-                '..',
-                '..',
-                'models',
-                type_str + '_{}_{}.{}.state'.format('*', '*', '*'),
+                '..', '..', 'models',
+                f'{type_str}_*_*.*.state',
             )
             file_list = glob.glob(pretrained_path)
-        else:
-            pretrained_path = None
 
         file_list.sort()
 
         try:
             return file_list[-1]
         except IndexError:
-            log.debug([local_path, pretrained_path, file_list])
+            log.debug([local_path, file_list])
             raise
 
     def initModels(self):
+        """Initialize all models."""
         log.debug(self.cli_args.segmentation_path)
         seg_dict = torch.load(self.cli_args.segmentation_path)
 
-        seg_model = UNetWrapper(
+        seg_model = get_segmentation_model(
+            'ultralightunet',
             in_channels=7,
             n_classes=1,
-            depth=3,
-            wf=4,
-            padding=True,
-            batch_norm=True,
-            up_mode='upconv',
         )
-
         seg_model.load_state_dict(seg_dict['model_state'])
         seg_model.eval()
 
         log.debug(self.cli_args.classification_path)
         cls_dict = torch.load(self.cli_args.classification_path)
 
-        model_cls = getattr(model, self.cli_args.cls_model)
-        cls_model = model_cls()
+        cls_model = get_model(self.cli_args.cls_model)
         cls_model.load_state_dict(cls_dict['model_state'])
         cls_model.eval()
 
@@ -238,77 +246,71 @@ class NoduleAnalysisApp:
             if torch.cuda.device_count() > 1:
                 seg_model = nn.DataParallel(seg_model)
                 cls_model = nn.DataParallel(cls_model)
-
             seg_model.to(self.device)
             cls_model.to(self.device)
 
+        malignancy_model = None
         if self.cli_args.malignancy_path:
-            model_cls = getattr(model, self.cli_args.malignancy_model)
-            malignancy_model = model_cls()
+            malignancy_model = get_model(self.cli_args.malignancy_model)
             malignancy_dict = torch.load(self.cli_args.malignancy_path)
             malignancy_model.load_state_dict(malignancy_dict['model_state'])
             malignancy_model.eval()
             if self.use_cuda:
                 malignancy_model.to(self.device)
-        else:
-            malignancy_model = None
+
         return seg_model, cls_model, malignancy_model
 
-
     def initSegmentationDl(self, series_uid):
-        seg_ds = Luna2dSegmentationDataset(
-                contextSlices_count=3,
-                series_uid=series_uid,
-                fullCt_bool=True,
-            )
-        seg_dl = DataLoader(
+        """Initialize segmentation data loader for a series."""
+        seg_ds = SegmentationDataset(
+            config=self.config,
+            context_slices=3,
+            series_uid=series_uid,
+            full_ct=True,
+        )
+        return DataLoader(
             seg_ds,
             batch_size=self.cli_args.batch_size * (torch.cuda.device_count() if self.use_cuda else 1),
             num_workers=self.cli_args.num_workers,
             pin_memory=self.use_cuda,
         )
 
-        return seg_dl
-
-    def initClassificationDl(self, candidateInfo_list):
-        cls_ds = LunaDataset(
-                sortby_str='series_uid',
-                candidateInfo_list=candidateInfo_list,
-            )
-        cls_dl = DataLoader(
+    def initClassificationDl(self, candidate_list):
+        """Initialize classification data loader for candidates."""
+        # Create a temporary dataset with just these candidates
+        cls_ds = _CandidateDataset(
+            candidates=candidate_list,
+            config=self.config,
+            ct_cache=self.ct_cache,
+        )
+        return DataLoader(
             cls_ds,
             batch_size=self.cli_args.batch_size * (torch.cuda.device_count() if self.use_cuda else 1),
             num_workers=self.cli_args.num_workers,
             pin_memory=self.use_cuda,
         )
 
-        return cls_dl
-
-
     def main(self):
-        log.info("Starting {}, {}".format(type(self).__name__, self.cli_args))
+        """Main analysis loop."""
+        log.info(f"Starting {type(self).__name__}, {self.cli_args}")
 
-        val_ds = LunaDataset(
+        # Get validation set series
+        val_ds = ClassificationDataset(
+            config=self.config,
             val_stride=10,
-            isValSet_bool=True,
+            is_validation=True,
         )
-        val_set = set(
-            candidateInfo_tup.series_uid
-            for candidateInfo_tup in val_ds.candidateInfo_list
-        )
-        positive_set = set(
-            candidateInfo_tup.series_uid
-            for candidateInfo_tup in getCandidateInfoList()
-            if candidateInfo_tup.isNodule_bool
-        )
+        val_set = set(c.series_uid for c in val_ds.candidates)
 
+        # Get all series with nodules
+        all_candidates = self.candidate_repo.get_all()
+        positive_set = set(c.series_uid for c in all_candidates if c.is_nodule)
+
+        # Determine which series to process
         if self.cli_args.series_uid:
             series_set = set(self.cli_args.series_uid.split(','))
         else:
-            series_set = set(
-                candidateInfo_tup.series_uid
-                for candidateInfo_tup in getCandidateInfoList()
-            )
+            series_set = set(c.series_uid for c in all_candidates)
 
         if self.cli_args.include_train:
             train_list = sorted(series_set - val_set)
@@ -316,170 +318,154 @@ class NoduleAnalysisApp:
             train_list = []
         val_list = sorted(series_set & val_set)
 
+        # Build candidate dict by series
+        candidate_dict = self.candidate_repo.get_by_series()
 
-        candidateInfo_dict = getCandidateInfoDict()
-        series_iter = enumerateWithEstimate(
-            val_list + train_list,
-            "Series",
-        )
-        all_confusion = np.zeros((3, 4), dtype=np.int)
-        for _, series_uid in series_iter:   # Loops over the series UIDs
-            ct = getCt(series_uid)  # Gets the CT 
-            mask_a = self.segmentCt(ct, series_uid) # Runs our segmentation model on it
+        # Process all series
+        series_iter = enumerateWithEstimate(val_list + train_list, "Series")
+        all_confusion = np.zeros((3, 4), dtype=np.int_)
 
-            candidateInfo_list = self.groupSegmentationOutput(  # Group the flagged voxels in the output
-                series_uid, ct, mask_a)
-            classifications_list = self.classifyCandidates( # Runs our nodule classifier on them
-                ct, candidateInfo_list)
+        for _, series_uid in series_iter:
+            ct = self.ct_cache.get_classification(series_uid)
+            mask_a = self.segmentCt(ct, series_uid)
+
+            candidate_list = self.groupSegmentationOutput(series_uid, ct, mask_a)
+            classifications_list = self.classifyCandidates(ct, candidate_list)
 
             if not self.cli_args.run_validation:
-                print(f"found nodule candidates in {series_uid}:")
+                print(f"Found nodule candidates in {series_uid}:")
                 for prob, prob_mal, center_xyz, center_irc in classifications_list:
-                    if prob > 0.5:  # ... for all candidates found by the segmentation where the classifier assigned a
-                                    # nodule probability of 50% or more. 
+                    if prob > 0.5:
                         s = f"nodule prob {prob:.3f}, "
                         if self.malignancy_model:
                             s += f"malignancy prob {prob_mal:.3f}, "
                         s += f"center xyz {center_xyz}"
                         print(s)
 
-            if series_uid in candidateInfo_dict:    # If we have the ground truth data, we compute and print the confusion 
-                                                    # matrix and also add the current results to the total
+            if series_uid in candidate_dict:
                 one_confusion = match_and_score(
-                    classifications_list, candidateInfo_dict[series_uid]
+                    classifications_list, candidate_dict[series_uid]
                 )
                 all_confusion += one_confusion
                 print_confusion(
                     series_uid, one_confusion, self.malignancy_model is not None
                 )
 
-        print_confusion(
-            "Total", all_confusion, self.malignancy_model is not None
-        )
+        print_confusion("Total", all_confusion, self.malignancy_model is not None)
 
-
-    def classifyCandidates(self, ct, candidateInfo_list):
-        cls_dl = self.initClassificationDl(candidateInfo_list)  # Again, we get a dataloader to loop over, this time 
-                                                                # based on our candidate list.
+    def classifyCandidates(self, ct, candidate_list):
+        """Classify candidates as nodule/non-nodule and malignant/benign."""
+        cls_dl = self.initClassificationDl(candidate_list)
         classifications_list = []
+
         for batch_ndx, batch_tup in enumerate(cls_dl):
             input_t, _, _, series_list, center_list = batch_tup
 
-            input_g = input_t.to(self.device)   # Sends the inputs to the device
+            input_g = input_t.to(self.device)
             with torch.no_grad():
-                _, probability_nodule_g = self.cls_model(input_g)   # Runs the inputs through the nodule vs non-nodule network
-                if self.malignancy_model is not None:   # If we have a malignancy model, we run that, too.
+                _, probability_nodule_g = self.cls_model(input_g)
+                if self.malignancy_model is not None:
                     _, probability_mal_g = self.malignancy_model(input_g)
                 else:
                     probability_mal_g = torch.zeros_like(probability_nodule_g)
 
-            zip_iter = zip(center_list,
-                probability_nodule_g[:,1].tolist(),
-                probability_mal_g[:,1].tolist())
-            for center_irc, prob_nodule, prob_mal in zip_iter:  # Does our bookkeping, constructing a list of our     
-                                                                # results
-                center_xyz = irc2xyz(center_irc,
-                    direction_a=ct.direction_a,
-                    origin_xyz=ct.origin_xyz,
-                    vxSize_xyz=ct.vxSize_xyz,
+            for center_irc, prob_nodule, prob_mal in zip(
+                center_list,
+                probability_nodule_g[:, 1].tolist(),
+                probability_mal_g[:, 1].tolist()
+            ):
+                center_xyz = irc2xyz(
+                    center_irc,
+                    origin_xyz=ct.metadata.origin_xyz,
+                    vxSize_xyz=ct.metadata.spacing_xyz,
+                    direction_a=ct.metadata.direction,
                 )
                 cls_tup = (prob_nodule, prob_mal, center_xyz, center_irc)
                 classifications_list.append(cls_tup)
+
         return classifications_list
 
     def segmentCt(self, ct, series_uid):
-        with torch.no_grad():   # We do not need gradients here, so we don't build the graph
-            output_a = np.zeros_like(ct.hu_a, dtype=np.float32) # This array will hold our output: a float
-                                                                # array of probability annotations
-            
-            seg_dl = self.initSegmentationDl(series_uid)    # We get a dataloader that lets us loop over our
-                                                            # Ct in batches
+        """Run segmentation on a CT scan."""
+        with torch.no_grad():
+            output_a = np.zeros_like(ct.hu_array, dtype=np.float32)
+            seg_dl = self.initSegmentationDl(series_uid)
+
             for input_t, _, _, slice_ndx_list in seg_dl:
+                input_g = input_t.to(self.device)
+                prediction_g = self.seg_model(input_g)
 
-                input_g = input_t.to(self.device)   # After moving the input to the GPU ... 
-                prediction_g = self.seg_model(input_g)  # .. We run segmentation model ...
-
-                for i, slice_ndx in enumerate(slice_ndx_list):  # ... And copy each element to the output array.
+                for i, slice_ndx in enumerate(slice_ndx_list):
                     output_a[slice_ndx] = prediction_g[i].cpu().numpy()
 
-            mask_a = output_a > 0.5 # Threshold the probability outputs to get a binary output, and the applies
-                                    # binary erosion as cleanup
-
-            mask_a = morphology.binary_erosion(mask_a, iterations=1)
+            mask_a = output_a > 0.5
+            mask_a = morphology.binary_erosion(mask_a, iterations=1)  # type: ignore[misc]
 
         return mask_a
 
-    def groupSegmentationOutput(self, series_uid,  ct, clean_a):
-        candidateLabel_a, candidate_count = measurements.label(clean_a) # Assign each voxel the label of the group it belongs to
+    def groupSegmentationOutput(self, series_uid, ct, clean_a):
+        """Group connected components in segmentation output."""
+        candidateLabel_a, candidate_count = measurements.label(clean_a)  # type: ignore[misc]
 
-        centerIrc_list = measurements.center_of_mass(   # Gets the center of mass for each for each group as index, row, column
-                                                        # coordinates
-            ct.hu_a.clip(-1000, 1000) + 1001,
+        centerIrc_list = measurements.center_of_mass(  # type: ignore[misc]
+            ct.hu_array.clip(-1000, 1000) + 1001,
             labels=candidateLabel_a,
-            index=np.arange(1, candidate_count+1),
+            index=np.arange(1, candidate_count + 1),
         )
 
-        candidateInfo_list = []
+        candidate_list = []
         for i, center_irc in enumerate(centerIrc_list):
-            center_xyz = irc2xyz(   # Converts the voxel coordinates to real patient coordinates
+            center_xyz = irc2xyz(
                 center_irc,
-                ct.origin_xyz,
-                ct.vxSize_xyz,
-                ct.direction_a,
+                origin_xyz=ct.metadata.origin_xyz,
+                vxSize_xyz=ct.metadata.spacing_xyz,
+                direction_a=ct.metadata.direction,
             )
             assert np.all(np.isfinite(center_irc)), repr(['irc', center_irc, i, candidate_count])
             assert np.all(np.isfinite(center_xyz)), repr(['xyz', center_xyz])
-            candidateInfo_tup = \
-                CandidateInfoTuple(False, False, False, 0.0, series_uid, center_xyz)    # Build our candidate info tuple and
-                                                                                        # appends it to the list of detections
-            candidateInfo_list.append(candidateInfo_tup)
 
-        return candidateInfo_list
+            candidate = CandidateInfo(
+                is_nodule=False,
+                has_annotation=False,
+                is_malignant=False,
+                diameter_mm=0.0,
+                series_uid=series_uid,
+                center_xyz=tuple(center_xyz),
+            )
+            candidate_list.append(candidate)
 
-    def logResults(self, mode_str, filtered_list, series2diagnosis_dict, positive_set):
-        count_dict = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
-        for series_uid in filtered_list:
-            probablity_float, center_irc = series2diagnosis_dict.get(series_uid, (0.0, None))
-            if center_irc is not None:
-                center_irc = tuple(int(x.item()) for x in center_irc)
-            positive_bool = series_uid in positive_set
-            prediction_bool = probablity_float > 0.5
-            correct_bool = positive_bool == prediction_bool
-
-            if positive_bool and prediction_bool:
-                count_dict['tp'] += 1
-            if not positive_bool and not prediction_bool:
-                count_dict['tn'] += 1
-            if not positive_bool and prediction_bool:
-                count_dict['fp'] += 1
-            if positive_bool and not prediction_bool:
-                count_dict['fn'] += 1
+        return candidate_list
 
 
-            log.info("{} {} Label:{!r:5} Pred:{!r:5} Correct?:{!r:5} Value:{:.4f} {}".format(
-                mode_str,
-                series_uid,
-                positive_bool,
-                prediction_bool,
-                correct_bool,
-                probablity_float,
-                center_irc,
-            ))
+class _CandidateDataset(Dataset):
+    """Minimal dataset for classification of detected candidates."""
 
-        total_count = sum(count_dict.values())
-        percent_dict = {k: v / (total_count or 1) * 100 for k, v in count_dict.items()}
+    CHUNK_SIZE = (32, 48, 48)
 
-        precision = percent_dict['p'] = count_dict['tp'] / ((count_dict['tp'] + count_dict['fp']) or 1)
-        recall    = percent_dict['r'] = count_dict['tp'] / ((count_dict['tp'] + count_dict['fn']) or 1)
-        percent_dict['f1'] = 2 * (precision * recall) / ((precision + recall) or 1)
+    def __init__(self, candidates, config, ct_cache):
+        super().__init__()
+        self.candidates = candidates
+        self.config = config
+        self.ct_cache = ct_cache
 
-        log.info(mode_str + " tp:{tp:.1f}%, tn:{tn:.1f}%, fp:{fp:.1f}%, fn:{fn:.1f}%".format(
-            **percent_dict,
-        ))
-        log.info(mode_str + " precision:{p:.3f}, recall:{r:.3f}, F1:{f1:.3f}".format(
-            **percent_dict,
-        ))
+    def __len__(self):
+        return len(self.candidates)
 
+    def __getitem__(self, idx):
+        candidate = self.candidates[idx]
+        ct = self.ct_cache.get_classification(candidate.series_uid)
+        chunk, center_irc = ct.extract_chunk(candidate.center_xyz, self.CHUNK_SIZE)
+
+        ct_tensor = torch.from_numpy(chunk).unsqueeze(0).float()
+
+        label = torch.tensor([
+            not candidate.is_nodule,
+            candidate.is_nodule,
+        ], dtype=torch.long)
+
+        label_idx = 1 if candidate.is_nodule else 0
+
+        return ct_tensor, label, label_idx, candidate.series_uid, center_irc
 
 
 if __name__ == '__main__':
